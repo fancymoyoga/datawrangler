@@ -113,4 +113,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Databricks runs spark_python_task inside IPython, where any sys.exit() (even 0) is
+    # reported as an exception and fails the run. Return normally on success; raise on failure.
+    if main() != 0:
+        raise RuntimeError("study_contacts load failed; see the FAILED lines above")
