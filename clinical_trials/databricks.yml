@@ -1,5 +1,5 @@
-# Databricks Asset Bundle: daily job that loads ClinicalTrials.gov FHIR contacts/locations
-# into a Unity Catalog Delta table. See load_study_contacts.py for what the task does.
+# Databricks Asset Bundle: daily job that loads ClinicalTrials.gov studies (from FHIR) into a
+# Unity Catalog Delta table, one row per study with all locations in one column. See load_study_contacts.py for what the task does.
 #
 #   databricks bundle validate -t dev
 #   databricks bundle deploy   -t dev
@@ -25,8 +25,8 @@ variables:
     description: Schema for the output table (must already exist).
     default: fhir_studies
   table:
-    description: Output table name.
-    default: study_contacts_locations
+    description: Output table name (one row per study).
+    default: studies
 
 resources:
   jobs:

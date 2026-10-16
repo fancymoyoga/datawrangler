@@ -3,12 +3,12 @@
 Usage:
     python fetch_study_fhir.py NCT04280705
     python fetch_study_fhir.py NCT04280705 --out raw/NCT04280705.fhir.json
-    python fetch_study_fhir.py NCT04280705 --csv raw/NCT04280705_contacts_locations.csv
+    python fetch_study_fhir.py NCT04280705 --csv raw/NCT04280705_study.csv
 
 Calls GET /studies/{nctId}?format=fhir.json. The response is a FHIR Bundle
 (content type application/fhir+json) whose entries include a ResearchStudy.
-fhir_contacts_locations_dataframe() turns it into a pandas DataFrame of
-NCTId, BriefTitle, OfficialTitle and ContactsLocationsModule values.
+fhir_study_dataframe() turns it into a one-row pandas DataFrame of
+NCTId, BriefTitle, OfficialTitle, EligibilityCriteria and ContactsLocationsModule values.
 """
 
 import argparse
@@ -108,13 +108,13 @@ def summarize_bundle(bundle: dict) -> dict:
     }
 
 
-# FHIR has no `fields` filter (the API returns 400), so these columns are pulled out of the
-# full Bundle locally. They mirror NCTId, BriefTitle, OfficialTitle, ContactsLocationsModule.
-# FHIR folds phoneExt into the phone value. site_status uses FHIR codes (e.g. "recruiting").
-CONTACT_COLUMNS = [
-    "nct_id", "brief_title", "official_title", "record_type",
-    "facility", "site_status", "city", "state", "zip", "country", "lat", "lon",
-    "contact_name", "contact_role", "contact_phone", "contact_email", "affiliation",
+# FHIR has no `fields` filter (the API returns 400), so these values are pulled out of the
+# full Bundle locally. They mirror NCTId, BriefTitle, OfficialTitle, EligibilityCriteria and
+# ContactsLocationsModule, as one record per study. FHIR folds phoneExt into the phone value;
+# site_status uses FHIR codes (e.g. "recruiting").
+STUDY_COLUMNS = [
+    "nct_id", "brief_title", "official_title", "eligibility_criteria",
+    "location_count", "locations", "central_contacts", "overall_officials",
 ]
 
 # associatedParty roles that are organisations or contacts, not overall officials.
@@ -133,6 +133,11 @@ def _telecom(item: dict, system: str) -> str | None:
     return "; ".join(v for v in values if v) or None
 
 
+def _float(value) -> float | None:
+    """JSON gives whole-number coordinates as int (e.g. 0); Spark DoubleType rejects int."""
+    return None if value is None else float(value)
+
+
 def _name_text(item: dict) -> str | None:
     names = item.get("name")
     if isinstance(names, list):
@@ -140,19 +145,24 @@ def _name_text(item: dict) -> str | None:
     return names
 
 
-def fhir_contacts_locations_dataframe(bundle: dict) -> "pd.DataFrame":
-    """One row per site contact, central contact, and overall official.
+def parse_study_fhir(bundle: dict) -> dict:
+    """One record for the study, with every site in `locations`.
 
-    record_type is "location", "central_contact", or "overall_official". A site with no
-    contacts still gets one row (contact columns empty). Every key is treated as optional.
+    locations:         [{facility, site_status, city, state, zip, country, lat, lon,
+                         contacts: [{name, role, phone, email}]}]
+    central_contacts:  [{name, role, phone, email}]
+    overall_officials: [{name, role, affiliation}]
+
+    Every key is treated as optional; missing values are None and missing lists are [].
     """
-    import pandas as pd  # imported here so the fetch functions work without pandas
-
     resources = [
         entry.get("resource", {}) for entry in bundle.get("entry", []) if isinstance(entry, dict)
     ]
     study = next((r for r in resources if r.get("resourceType") == "ResearchStudy"), {})
     contained = {c.get("id"): c for c in study.get("contained", [])}
+
+    def resolve(ref: dict) -> dict:
+        return contained.get((ref.get("reference") or "").lstrip("#"), {})
 
     nct_id = next(
         (
@@ -170,12 +180,23 @@ def fhir_contacts_locations_dataframe(bundle: dict) -> "pd.DataFrame":
         ),
         None,
     )
-    base = {"nct_id": nct_id, "brief_title": study.get("title"), "official_title": official_title}
+    # recruitment.eligibility points (by identifier, not reference) at a Group whose
+    # description holds the eligibilityCriteria text. Look in the Bundle and in contained.
+    eligibility_id = (
+        study.get("recruitment", {}).get("eligibility", {}).get("identifier", {}).get("value")
+    )
+    eligibility_group = next(
+        (
+            r
+            for r in [*resources, *contained.values()]
+            if r.get("resourceType") == "Group"
+            and eligibility_id
+            and any(i.get("value") == eligibility_id for i in r.get("identifier", []))
+        ),
+        {},
+    )
 
-    def resolve(ref: dict) -> dict:
-        return contained.get((ref.get("reference") or "").lstrip("#"), {})
-
-    rows = []
+    locations = []
     for site_ref in study.get("site", []):
         location = resolve(site_ref)
         site_status = None
@@ -189,54 +210,63 @@ def fhir_contacts_locations_dataframe(bundle: dict) -> "pd.DataFrame":
             location = resolve(next(iter(location.get("site", [])), {}))
         address = location.get("address", {})
         position = location.get("position", {})
-        site = {
-            **base,
-            "record_type": "location",
+        locations.append({
             "facility": location.get("name"),
             "site_status": site_status,
             "city": address.get("city"),
             "state": address.get("state"),
             "zip": address.get("postalCode"),
             "country": address.get("country"),
-            "lat": position.get("latitude"),
-            "lon": position.get("longitude"),
-        }
-        contacts = location.get("contact", [])
-        if not contacts:
-            rows.append(site)
-        for contact in contacts:
-            rows.append({
-                **site,
-                "contact_name": _name_text(contact),
-                "contact_role": _coding(contact.get("purpose"))[1],
-                "contact_phone": _telecom(contact, "phone"),
-                "contact_email": _telecom(contact, "email"),
-            })
+            "lat": _float(position.get("latitude")),
+            "lon": _float(position.get("longitude")),
+            "contacts": [
+                {
+                    "name": _name_text(contact),
+                    "role": _coding(contact.get("purpose"))[1],
+                    "phone": _telecom(contact, "phone"),
+                    "email": _telecom(contact, "email"),
+                }
+                for contact in location.get("contact", [])
+            ],
+        })
 
+    central_contacts, overall_officials = [], []
     for party in study.get("associatedParty", []):
         role_code, role_display = _coding(party.get("role"))
         ref = (party.get("party", {}).get("reference") or "").lstrip("#")
         if role_code == "recruitment-contact":
             practitioner = contained.get(ref, {})
-            rows.append({
-                **base,
-                "record_type": "central_contact",
-                "contact_name": party.get("name") or _name_text(practitioner),
-                "contact_role": _coding((party.get("classifier") or [{}])[0])[1],
-                "contact_phone": _telecom(practitioner, "phone"),
-                "contact_email": _telecom(practitioner, "email"),
+            central_contacts.append({
+                "name": party.get("name") or _name_text(practitioner),
+                "role": _coding((party.get("classifier") or [{}])[0])[1],
+                "phone": _telecom(practitioner, "phone"),
+                "email": _telecom(practitioner, "email"),
             })
         # The responsible-party PI points at a contained PractitionerRole; officials don't.
         elif role_code not in _NON_OFFICIAL_ROLES and "-ResponsibleParty-" not in ref:
-            rows.append({
-                **base,
-                "record_type": "overall_official",
-                "contact_name": party.get("name"),
-                "contact_role": role_display,
+            overall_officials.append({
+                "name": party.get("name"),
+                "role": role_display,
                 "affiliation": party.get("party", {}).get("display"),
             })
 
-    return pd.DataFrame(rows, columns=CONTACT_COLUMNS)
+    return {
+        "nct_id": nct_id,
+        "brief_title": study.get("title"),
+        "official_title": official_title,
+        "eligibility_criteria": eligibility_group.get("description"),
+        "location_count": len(locations),
+        "locations": locations,
+        "central_contacts": central_contacts,
+        "overall_officials": overall_officials,
+    }
+
+
+def fhir_study_dataframe(bundle: dict) -> "pd.DataFrame":
+    """One-row DataFrame for the study; locations/contacts/officials are lists of dicts."""
+    import pandas as pd  # imported here so the fetch functions work without pandas
+
+    return pd.DataFrame([parse_study_fhir(bundle)], columns=STUDY_COLUMNS)
 
 
 def main() -> int:
@@ -250,7 +280,7 @@ def main() -> int:
     parser.add_argument(
         "--csv",
         type=Path,
-        help="Write the contacts/locations DataFrame here as CSV (requires pandas).",
+        help="Write the one-row study DataFrame here as CSV, lists as JSON (requires pandas).",
     )
     args = parser.parse_args()
 
@@ -276,7 +306,9 @@ def main() -> int:
     print(json.dumps(summarize_bundle(bundle), indent=2))
 
     if args.csv:
-        frame = fhir_contacts_locations_dataframe(bundle)
+        frame = fhir_study_dataframe(bundle)
+        for column in ("locations", "central_contacts", "overall_officials"):
+            frame[column] = frame[column].map(json.dumps)
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         frame.to_csv(args.csv, index=False)
         print(f"Wrote {args.csv} ({len(frame)} rows)", file=sys.stderr)

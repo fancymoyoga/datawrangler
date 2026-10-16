@@ -1,12 +1,13 @@
-"""Databricks job entry point: load FHIR contacts/locations for NCT IDs into a Delta table.
+"""Databricks job entry point: load one row per study (from FHIR) into a Delta table.
 
 Run by the `study_contacts` job in databricks.yml (spark_python_task). Parameters:
     --nct-ids  comma- or pipe-separated NCT IDs, e.g. "NCT04280705,NCT07649629"
-    --table    three-part Unity Catalog name, e.g. "clinicaltrials.fhir_studies.study_contacts_locations"
+    --table    three-part Unity Catalog name, e.g. "clinicaltrials.fhir_studies.studies"
 
-For each NCT ID: fetch GET /studies/{nctId}?format=fhir.json, flatten it with
-fhir_contacts_locations_dataframe(), and replace that study's rows in the table. Re-running
-for the same IDs is idempotent. Fails the run if any ID can't be fetched, after loading the rest.
+For each NCT ID: fetch GET /studies/{nctId}?format=fhir.json, parse it with
+parse_study_fhir(), and replace that study's row in the table. `locations`,
+`central_contacts` and `overall_officials` are array<struct> columns. Re-running for the
+same IDs is idempotent. Fails the run if any ID can't be fetched, after loading the rest.
 """
 
 import argparse
@@ -18,29 +19,58 @@ import sys
 # module (synced by the bundle) can be imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 
-import pandas as pd  # noqa: E402
 import requests  # noqa: E402
 from pyspark.sql import SparkSession  # noqa: E402
 from pyspark.sql.functions import current_timestamp  # noqa: E402
-from pyspark.sql.types import DoubleType, StringType, StructField, StructType  # noqa: E402
+from pyspark.sql.types import (  # noqa: E402
+    ArrayType,
+    DoubleType,
+    IntegerType,
+    StringType,
+    StructField,
+    StructType,
+)
 
 from fetch_study_fhir import (  # noqa: E402
-    CONTACT_COLUMNS,
+    STUDY_COLUMNS,
     ApiError,
     check_api_version,
     fetch_study_fhir,
-    fhir_contacts_locations_dataframe,
+    parse_study_fhir,
     validate_nct_id,
 )
 
 TABLE_NAME_PATTERN = r"[A-Za-z0-9_]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+"
 
-# Explicit schema: Spark can't infer a type for columns that are all null (common for
-# lat/lon, site_status, affiliation in small studies). loaded_at is added by Spark in
-# write_table, not from pandas: serverless (Spark Connect) rejects tz-naive pandas Timestamps.
-SCHEMA = StructType(
-    [StructField(c, DoubleType() if c in ("lat", "lon") else StringType()) for c in CONTACT_COLUMNS]
+
+def _strings(*names: str) -> list[StructField]:
+    return [StructField(n, StringType()) for n in names]
+
+
+CONTACT = StructType(_strings("name", "role", "phone", "email"))
+LOCATION = StructType(
+    _strings("facility", "site_status", "city", "state", "zip", "country")
+    + [
+        StructField("lat", DoubleType()),
+        StructField("lon", DoubleType()),
+        StructField("contacts", ArrayType(CONTACT)),
+    ]
 )
+OFFICIAL = StructType(_strings("name", "role", "affiliation"))
+
+# Explicit schema: Spark can't infer types for null fields or empty lists. Field order
+# must match STUDY_COLUMNS. loaded_at is added by Spark in write_table: serverless
+# (Spark Connect) rejects tz-naive pandas/Python timestamps.
+SCHEMA = StructType(
+    _strings("nct_id", "brief_title", "official_title", "eligibility_criteria")
+    + [
+        StructField("location_count", IntegerType()),
+        StructField("locations", ArrayType(LOCATION)),
+        StructField("central_contacts", ArrayType(CONTACT)),
+        StructField("overall_officials", ArrayType(OFFICIAL)),
+    ]
+)
+assert [f.name for f in SCHEMA.fields] == STUDY_COLUMNS
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -59,52 +89,51 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def build_frame(nct_ids: list[str]) -> tuple[pd.DataFrame, list[str]]:
-    """Fetch and flatten each study. Returns (rows for all fetched studies, failed IDs)."""
-    frames, failed = [], []
+def build_records(nct_ids: list[str]) -> tuple[list[dict], list[str]]:
+    """Fetch and parse each study. Returns (one record per fetched study, failed IDs)."""
+    records, failed = [], []
     with requests.Session() as session:
         check_api_version(session)  # stop the whole run on spec drift
         for nct_id in nct_ids:
             try:
-                frame = fhir_contacts_locations_dataframe(fetch_study_fhir(session, nct_id))
+                record = parse_study_fhir(fetch_study_fhir(session, nct_id))
             except (ApiError, requests.RequestException) as exc:
                 print(f"FAILED {nct_id}: {exc}", file=sys.stderr)
                 failed.append(nct_id)
                 continue
             # Key rows by the requested ID; an alias ID redirects to the current record.
-            frame["nct_id"] = frame["nct_id"].fillna(nct_id)
-            print(f"{nct_id}: {len(frame)} rows")
-            frames.append(frame)
-
-    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=CONTACT_COLUMNS)
-    return combined, failed
+            record["nct_id"] = record["nct_id"] or nct_id
+            print(f"{nct_id}: {record['location_count']} locations")
+            records.append(record)
+    return records, failed
 
 
-def write_table(spark: SparkSession, frame: pd.DataFrame, table: str) -> None:
-    """Replace the rows for the studies in `frame`, leaving other studies untouched."""
-    records = frame[CONTACT_COLUMNS].astype(object).where(frame.notna(), None).to_dict("records")
-    sdf = spark.createDataFrame(records, schema=SCHEMA).withColumn("loaded_at", current_timestamp())
+def write_table(spark: SparkSession, records: list[dict], table: str) -> None:
+    """Replace the rows for the studies in `records`, leaving other studies untouched."""
+    sdf = spark.createDataFrame(
+        [[r[c] for c in STUDY_COLUMNS] for r in records], schema=SCHEMA
+    ).withColumn("loaded_at", current_timestamp())
 
-    loaded_ids = sorted(frame["nct_id"].dropna().unique())
     if not spark.catalog.tableExists(table):
         sdf.write.format("delta").saveAsTable(table)
         return
-    id_list = ", ".join(f"'{i}'" for i in loaded_ids)  # IDs already pattern-validated
+    id_list = ", ".join(f"'{r['nct_id']}'" for r in records)  # IDs already pattern-validated
     (
         sdf.write.format("delta")
         .mode("overwrite")
         .option("replaceWhere", f"nct_id IN ({id_list})")
+        .option("mergeSchema", "true")  # adds new columns to the table
         .saveAsTable(table)
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    frame, failed = build_frame(args.nct_ids)
+    records, failed = build_records(args.nct_ids)
 
-    if not frame.empty:
-        write_table(SparkSession.builder.getOrCreate(), frame, args.table)
-        print(f"Wrote {len(frame)} rows for {frame['nct_id'].nunique()} studies to {args.table}")
+    if records:
+        write_table(SparkSession.builder.getOrCreate(), records, args.table)
+        print(f"Wrote {len(records)} studies to {args.table}")
 
     if failed:
         print(f"{len(failed)} of {len(args.nct_ids)} studies failed: {', '.join(failed)}", file=sys.stderr)

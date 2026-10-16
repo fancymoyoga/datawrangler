@@ -28,11 +28,11 @@ python -m py_compile <script>.py
 
 # Fetch one study as a FHIR Bundle (raw/ is git-ignored)
 python fetch_study_fhir.py NCT04280705 --out raw/NCT04280705.fhir.json
-# ...and its NCTId/titles/ContactsLocationsModule as CSV (needs pandas)
-python fetch_study_fhir.py NCT04280705 --csv raw/NCT04280705_contacts_locations.csv
+# ...and one row per study (titles, eligibility, locations as JSON) as CSV (needs pandas)
+python fetch_study_fhir.py NCT04280705 --csv raw/NCT04280705_study.csv
 
 # Databricks Asset Bundle (databricks.yml): job `study_contacts` runs load_study_contacts.py
-# and writes to ${catalog}.${schema}.study_contacts_locations. Needs the Databricks CLI.
+# and writes one row per study to ${catalog}.${schema}.studies. Needs the Databricks CLI.
 databricks bundle validate -t dev
 databricks bundle deploy -t dev
 databricks bundle run -t dev study_contacts
