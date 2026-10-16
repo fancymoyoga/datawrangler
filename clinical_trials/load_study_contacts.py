@@ -2,7 +2,7 @@
 
 Run by the `study_contacts` job in databricks.yml (spark_python_task). Parameters:
     --nct-ids  comma- or pipe-separated NCT IDs, e.g. "NCT04280705,NCT07649629"
-    --table    three-part Unity Catalog name, e.g. "clinical_trials.fhir_studies.study_contacts_locations"
+    --table    three-part Unity Catalog name, e.g. "clinicaltrials.fhir_studies.study_contacts_locations"
 
 For each NCT ID: fetch GET /studies/{nctId}?format=fhir.json, flatten it with
 fhir_contacts_locations_dataframe(), and replace that study's rows in the table. Re-running

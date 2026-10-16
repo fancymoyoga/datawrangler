@@ -20,7 +20,7 @@ variables:
     default: NCT04280705,NCT05236946,NCT07649629
   catalog:
     description: Unity Catalog catalog for the output table (must already exist).
-    default: clinical_trials
+    default: clinicaltrials
   schema:
     description: Schema for the output table (must already exist).
     default: fhir_studies
