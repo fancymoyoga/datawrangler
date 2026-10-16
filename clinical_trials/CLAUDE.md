@@ -31,6 +31,12 @@ python fetch_study_fhir.py NCT04280705 --out raw/NCT04280705.fhir.json
 # ...and its NCTId/titles/ContactsLocationsModule as CSV (needs pandas)
 python fetch_study_fhir.py NCT04280705 --csv raw/NCT04280705_contacts_locations.csv
 
+# Databricks Asset Bundle (databricks.yml): job `study_contacts` runs load_study_contacts.py
+# and writes to ${catalog}.${schema}.study_contacts_locations. Needs the Databricks CLI.
+databricks bundle validate -t dev
+databricks bundle deploy -t dev
+databricks bundle run -t dev study_contacts
+
 # study_dataframe/: one study -> pandas DataFrames (own venv, raw/ git-ignored)
 cd study_dataframe && python -m venv .venv && .venv/Scripts/python -m pip install -r requirements.txt
 .venv/Scripts/python study_dataframe.py NCT04280705 --csv-dir raw

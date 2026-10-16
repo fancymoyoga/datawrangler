@@ -1,19 +1,69 @@
-# This is a Declarative Automation Bundle definition for clinical_trials.
-# The Databricks extension requires databricks.yml configuration file.
-# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
-
+# Databricks Asset Bundle: daily job that loads ClinicalTrials.gov FHIR contacts/locations
+# into a Unity Catalog Delta table. See load_study_contacts.py for what the task does.
+#
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t dev
+#   databricks bundle run      -t dev study_contacts
 bundle:
   name: clinical_trials
 
+# Upload only what the job needs (bundle sync also skips anything in .gitignore).
+sync:
+  exclude:
+    - study_dataframe/**
+    - raw/**
+    - "*.ipynb"
+
+variables:
+  nct_ids:
+    description: Comma-separated NCT IDs to load.
+    default: NCT04280705,NCT05236946,NCT07649629
+  catalog:
+    description: Unity Catalog catalog for the output table (must already exist).
+    default: clinical_trials
+  schema:
+    description: Schema for the output table (must already exist).
+    default: fhir_studies
+  table:
+    description: Output table name.
+    default: study_contacts_locations
+
+resources:
+  jobs:
+    study_contacts:
+      name: study_contacts
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"  # 06:00 UTC daily; paused automatically in dev
+        timezone_id: UTC
+      tasks:
+        - task_key: load_study_contacts
+          spark_python_task:
+            python_file: ./load_study_contacts.py
+            parameters:
+              - --nct-ids
+              - ${var.nct_ids}
+              - --table
+              - ${var.catalog}.${var.schema}.${var.table}
+          environment_key: default
+          max_retries: 1
+          min_retry_interval_millis: 300000
+      # Serverless compute. pandas and requests ship with the serverless base environment.
+      # The workspace must allow outbound HTTPS to clinicaltrials.gov.
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+
 targets:
   dev:
-    mode: development
+    mode: development  # prefixes resource names with [dev <user>] and pauses schedules
     default: true
     workspace:
       host: https://dbc-2831e5fc-ccb1.cloud.databricks.com
 
-  ## Optionally, there could be 'staging' or 'prod' targets here.
-  #
-  # prod:
-  #   workspace:
-  #     host: https://dbc-2831e5fc-ccb1.cloud.databricks.com
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-2831e5fc-ccb1.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
