@@ -28,6 +28,8 @@ python -m py_compile <script>.py
 
 # Fetch one study as a FHIR Bundle (raw/ is git-ignored)
 python fetch_study_fhir.py NCT04280705 --out raw/NCT04280705.fhir.json
+# ...and its NCTId/titles/ContactsLocationsModule as CSV (needs pandas)
+python fetch_study_fhir.py NCT04280705 --csv raw/NCT04280705_contacts_locations.csv
 
 # study_dataframe/: one study -> pandas DataFrames (own venv, raw/ git-ignored)
 cd study_dataframe && python -m venv .venv && .venv/Scripts/python -m pip install -r requirements.txt
