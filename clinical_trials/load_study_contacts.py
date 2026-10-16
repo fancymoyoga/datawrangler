@@ -13,7 +13,6 @@ import argparse
 import os
 import re
 import sys
-from datetime import datetime, timezone
 
 # spark_python_task doesn't put the script's folder on sys.path; add it so the sibling
 # module (synced by the bundle) can be imported.
@@ -22,7 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 import pandas as pd  # noqa: E402
 import requests  # noqa: E402
 from pyspark.sql import SparkSession  # noqa: E402
-from pyspark.sql.types import DoubleType, StringType, StructField, StructType, TimestampType  # noqa: E402
+from pyspark.sql.functions import current_timestamp  # noqa: E402
+from pyspark.sql.types import DoubleType, StringType, StructField, StructType  # noqa: E402
 
 from fetch_study_fhir import (  # noqa: E402
     CONTACT_COLUMNS,
@@ -36,10 +36,10 @@ from fetch_study_fhir import (  # noqa: E402
 TABLE_NAME_PATTERN = r"[A-Za-z0-9_]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+"
 
 # Explicit schema: Spark can't infer a type for columns that are all null (common for
-# lat/lon, site_status, affiliation in small studies).
+# lat/lon, site_status, affiliation in small studies). loaded_at is added by Spark in
+# write_table, not from pandas: serverless (Spark Connect) rejects tz-naive pandas Timestamps.
 SCHEMA = StructType(
     [StructField(c, DoubleType() if c in ("lat", "lon") else StringType()) for c in CONTACT_COLUMNS]
-    + [StructField("loaded_at", TimestampType())]
 )
 
 
@@ -77,14 +77,13 @@ def build_frame(nct_ids: list[str]) -> tuple[pd.DataFrame, list[str]]:
             frames.append(frame)
 
     combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=CONTACT_COLUMNS)
-    combined["loaded_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
     return combined, failed
 
 
 def write_table(spark: SparkSession, frame: pd.DataFrame, table: str) -> None:
     """Replace the rows for the studies in `frame`, leaving other studies untouched."""
-    records = frame.astype(object).where(frame.notna(), None).to_dict("records")
-    sdf = spark.createDataFrame(records, schema=SCHEMA)
+    records = frame[CONTACT_COLUMNS].astype(object).where(frame.notna(), None).to_dict("records")
+    sdf = spark.createDataFrame(records, schema=SCHEMA).withColumn("loaded_at", current_timestamp())
 
     loaded_ids = sorted(frame["nct_id"].dropna().unique())
     if not spark.catalog.tableExists(table):
