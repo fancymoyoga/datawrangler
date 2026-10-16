@@ -138,5 +138,14 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def _running_in_notebook() -> bool:
+    """True inside IPython/Jupyter/Databricks, where sys.argv holds the kernel's own args (-f ...)."""
+    try:
+        get_ipython  # noqa: F821  (injected into builtins by IPython kernels)
+    except NameError:
+        return False
+    return True
+
+
+if __name__ == "__main__" and not _running_in_notebook():
     sys.exit(main())
