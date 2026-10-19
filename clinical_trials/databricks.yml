@@ -34,7 +34,7 @@ resources:
       name: study_contacts
       max_concurrent_runs: 1
       schedule:
-        quartz_cron_expression: "0 0 6 * * ?"  # 06:00 UTC daily; paused automatically in dev
+        quartz_cron_expression: "0 0 6 * * ?" # 06:00 UTC daily; paused automatically in dev
         timezone_id: UTC
       tasks:
         - task_key: load_study_contacts
@@ -44,7 +44,7 @@ resources:
               - --nct-ids
               - ${var.nct_ids}
               - --table
-              - ${var.catalog}.${var.schema}.${var.table}
+              - clinicaltrials.${var.schema}.${var.table}
           environment_key: default
           max_retries: 1
           min_retry_interval_millis: 300000
@@ -57,7 +57,7 @@ resources:
 
 targets:
   dev:
-    mode: development  # prefixes resource names with [dev <user>] and pauses schedules
+    mode: development # prefixes resource names with [dev <user>] and pauses schedules
     default: true
     workspace:
       host: https://dbc-2831e5fc-ccb1.cloud.databricks.com
