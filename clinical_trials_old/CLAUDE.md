@@ -32,7 +32,7 @@ python fetch_study_fhir.py NCT04280705 --out raw/NCT04280705.fhir.json
 python fetch_study_fhir.py NCT04280705 --csv raw/NCT04280705_study.csv
 
 # Databricks Asset Bundle (databricks.yml): job `clinical_trials_fhir` runs load_study_contacts.py
-# and writes one row per study to ${catalog}.${schema}.studies. Needs the Databricks CLI.
+# and writes one row per study to ${catalog}.${schema}.study_contacts_fhir. Needs the Databricks CLI.
 databricks bundle validate -t dev
 databricks bundle deploy -t dev
 databricks bundle run -t dev clinical_trials_fhir
