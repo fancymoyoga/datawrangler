@@ -9,8 +9,11 @@ resources:
           default: ${var.catalog}
         - name: schema
           default: ${resources.schemas.clinical_trials.name}
-        - name: nct_ids
-          default: NCT03506373
+        - name: condition
+          # ClinicalTrials.gov query.cond search (Essie syntax)
+          default: lung cancer
+        - name: max_studies
+          default: "100"
         - name: landing_path
           # Must match the pipeline's landing_path configuration.
           default: /Volumes/${var.catalog}/${resources.schemas.clinical_trials.name}/${resources.volumes.landing.name}/studies

@@ -1,12 +1,12 @@
 """Local fallback for src/01_ingest_api.py.
 
-Fetches studies from the ClinicalTrials.gov v2 API on this machine, writes the same
-landing envelopes, and uploads them to the landing volume with `databricks fs cp`.
-Use it when Databricks compute cannot reach the API. Stdlib only.
+Searches the ClinicalTrials.gov v2 API on this machine, writes the same landing envelopes,
+and uploads them to the landing volume with `databricks fs cp`. Use it when Databricks
+compute cannot reach the API. Stdlib only.
 
     python scripts/fetch_and_upload.py --profile monicaenders \
         --landing-path /Volumes/workspace/dev_monica_enders_clinical_trials/landing/studies \
-        --nct-ids "NCT03506373, NCT01234567"
+        --condition "lung cancer" --max-studies 100
 """
 
 import argparse
@@ -17,7 +17,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from ctgov_client import fetch_all, parse_nct_ids  # noqa: E402
+from ctgov_client import fetch_search  # noqa: E402
 
 
 def upload(local_dir, landing_path, profile):
@@ -38,7 +38,8 @@ def upload(local_dir, landing_path, profile):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--nct-ids", default="NCT03506373", help="comma-, semicolon- or space-separated")
+    parser.add_argument("--condition", default="lung cancer", help="condition to search (query.cond)")
+    parser.add_argument("--max-studies", type=int, default=100, help="cap on studies landed")
     parser.add_argument("--landing-path", required=True, help="/Volumes/<catalog>/<schema>/<volume>/<folder>")
     parser.add_argument("--profile", help="Databricks CLI profile (required unless --no-upload)")
     parser.add_argument("--out-dir", help="keep the local files here (default: a temp dir, deleted after upload)")
@@ -50,15 +51,16 @@ def main():
         parser.error("--landing-path must be a /Volumes/... path")
     if not args.no_upload and not args.profile:
         parser.error("--profile is required to upload")
-    nct_ids = parse_nct_ids(args.nct_ids)
 
     out_dir = args.out_dir or tempfile.mkdtemp(prefix="ctgov_landing_")
     try:
-        written, unreachable = fetch_all(nct_ids, out_dir)
+        result, unreachable = fetch_search(args.condition, out_dir, args.max_studies)
         if unreachable:
             print(f"ERROR: API unreachable from this machine too: {unreachable}", file=sys.stderr)
-        if written and not args.no_upload:
+        if result["written"] and not args.no_upload:
             upload(out_dir, landing_path, args.profile)
+        print(f"{len(result['written'])} studies landed of {result['total_count']} matching "
+              f"in {result['pages']} page(s)")
         if args.no_upload or args.out_dir:
             print(f"local files in {out_dir}")
     finally:

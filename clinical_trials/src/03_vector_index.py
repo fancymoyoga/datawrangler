@@ -125,10 +125,16 @@ except NotFound:
     )
 
 
+source_rows = spark.table(SOURCE_TABLE).count()
+
+
 def index_state():
+    # `ready` stays true from the previous sync while a new one runs, so also wait for the
+    # indexed row count to reach the source table's.
     status = w.vector_search_indexes.get_index(INDEX_NAME).status
     rows = status.indexed_row_count if status else None
-    return bool(status and status.ready), f"ready={status.ready if status else None} rows={rows} {status.message if status else ''}"
+    done = bool(status and status.ready) and rows == source_rows
+    return done, f"ready={status.ready if status else None} rows={rows}/{source_rows} {status.message if status else ''}"
 
 
 wait_for(f"index {INDEX_NAME}", index_state)
@@ -137,6 +143,8 @@ wait_for(f"index {INDEX_NAME}", index_state)
 
 expected = spark.table(GOLD_TABLE).count()
 indexed = w.vector_search_indexes.get_index(INDEX_NAME).status.indexed_row_count
+if indexed != expected:
+    raise RuntimeError(f"{INDEX_NAME} has {indexed} rows but {GOLD_TABLE} has {expected}")
 probe = w.vector_search_indexes.query_index(
     index_name=INDEX_NAME, columns=["nct_id", "brief_title"], query_text="clinical trial", num_results=3)
 summary = {"index": INDEX_NAME, "endpoint": VS_ENDPOINT, "source_table": SOURCE_TABLE,

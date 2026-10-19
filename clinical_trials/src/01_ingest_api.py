@@ -2,12 +2,14 @@
 # MAGIC %md
 # MAGIC # Ingest studies from the ClinicalTrials.gov v2 API
 # MAGIC
-# MAGIC Fetches each NCT ID and lands one JSON envelope per study per run at
-# MAGIC `{landing_path}/{NCT_ID}/{utc_timestamp}_{NCT_ID}.json`. Non-200 responses are landed too,
-# MAGIC so silver can quarantine them.
+# MAGIC Searches `GET /studies?query.cond=<condition>` (sorted by relevance, following
+# MAGIC `nextPageToken`) and lands up to `max_studies` studies, one JSON envelope per study per run,
+# MAGIC at `{landing_path}/{NCT_ID}/{utc_timestamp}_{NCT_ID}.json`. A failed page is landed too
+# MAGIC (folder `QUERY_ERROR`) so silver can quarantine it.
 # MAGIC
 # MAGIC Parameters:
-# MAGIC - `nct_ids`: comma-, semicolon- or space-separated NCT IDs
+# MAGIC - `condition`: condition or disease to search for, e.g. `lung cancer` (Essie syntax)
+# MAGIC - `max_studies`: cap on studies landed per run
 # MAGIC - `landing_path`: folder in the landing volume, e.g. `/Volumes/workspace/<schema>/landing/studies`
 
 # COMMAND ----------
@@ -15,19 +17,22 @@
 import json
 import os
 
-from ctgov_client import fetch_all, parse_nct_ids
+from ctgov_client import fetch_search
 
-dbutils.widgets.text("nct_ids", "NCT03506373")
+dbutils.widgets.text("condition", "lung cancer")
+dbutils.widgets.text("max_studies", "100")
 dbutils.widgets.text("landing_path", "")
 
-nct_ids = parse_nct_ids(dbutils.widgets.get("nct_ids"))
+condition = dbutils.widgets.get("condition")
+max_studies = int(dbutils.widgets.get("max_studies"))
 landing_path = dbutils.widgets.get("landing_path").rstrip("/")
 if not landing_path.startswith("/Volumes/"):
     raise ValueError(f"landing_path must be a /Volumes/... path, got {landing_path!r}")
 
 # COMMAND ----------
 
-written, unreachable = fetch_all(nct_ids, landing_path)
+result, unreachable = fetch_search(condition, landing_path, max_studies)
+written = result["written"]
 
 # COMMAND ----------
 
@@ -45,9 +50,11 @@ def landed_file_count(root):
 
 
 summary = {
-    "requested": len(nct_ids),
+    "condition": condition,
+    "total_matching": result["total_count"],
+    "pages": result["pages"],
     "landed": len(written),
-    "non_200": [{"nct_id": i, "http_status": s} for i, s, _ in written if s != 200],
+    "non_200": [{"path": p, "http_status": s} for _, s, p in written if s != 200],
 }
 
 if unreachable:
@@ -59,12 +66,12 @@ if unreachable:
             f"{landing_path} has no landed files yet, so the pipeline has nothing to read.\n"
             "Free Edition can restrict outbound internet. Land the data from your machine instead:\n"
             f"  python scripts/fetch_and_upload.py --profile <PROFILE> --landing-path {landing_path} "
-            f"--nct-ids \"{','.join(nct_ids)}\"\n"
+            f"--condition \"{condition}\" --max-studies {max_studies}\n"
             "then re-run this job (it will pass once files exist) or run the pipeline directly."
         )
     print(
         f"WARNING: ClinicalTrials.gov API is unreachable ({unreachable}). "
-        f"Skipped {len(nct_ids) - len(written)} of {len(nct_ids)} IDs; continuing with the "
+        f"Landed {len(written)} studies before it dropped; continuing with the "
         f"{existing} file(s) already in {landing_path}. "
         "Run scripts/fetch_and_upload.py locally to refresh them."
     )

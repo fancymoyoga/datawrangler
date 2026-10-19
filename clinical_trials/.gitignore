@@ -1,2 +1,4 @@
 raw/
 .databricks
+.venv/
+__pycache__/

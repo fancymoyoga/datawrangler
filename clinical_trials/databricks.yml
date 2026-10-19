@@ -1,69 +1,47 @@
-# Databricks Asset Bundle: daily job that loads ClinicalTrials.gov studies (from FHIR) into a
-# Unity Catalog Delta table, one row per study with all locations in one column. See load_study_contacts.py for what the task does.
-#
-#   databricks bundle validate -t dev
-#   databricks bundle deploy   -t dev
-#   databricks bundle run      -t dev study_contacts
+# This is a Declarative Automation Bundle definition for clinical_trials.
+# The Databricks extension requires databricks.yml configuration file.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
 bundle:
   name: clinical_trials
 
-# Upload only what the job needs (bundle sync also skips anything in .gitignore).
+include:
+  - resources/*.yml
+
+# Upload only what the jobs need (bundle sync also skips anything in .gitignore).
 sync:
   exclude:
     - study_dataframe/**
-    - raw/**
     - "*.ipynb"
+    - "**/__pycache__/**"
 
 variables:
-  nct_ids:
-    description: Comma-separated NCT IDs to load.
-    default: NCT04280705,NCT05236946,NCT07649629
   catalog:
-    description: Unity Catalog catalog for the output table (must already exist).
+    description: Unity Catalog catalog for all clinical trials data
+    default: workspace
+  # study_contacts job (FHIR loader)
+  fhir_nct_ids:
+    description: Comma-separated NCT IDs for the study_contacts job to load.
+    default: NCT04280705,NCT05236946,NCT07649629
+  fhir_catalog:
+    description: Catalog for the study_contacts output table (must already exist).
     default: clinicaltrials
-  schema:
-    description: Schema for the output table (must already exist).
+  fhir_schema:
+    description: Schema for the study_contacts output table (must already exist).
     default: fhir_studies
-  table:
-    description: Output table name (one row per study).
+  fhir_table:
+    description: study_contacts output table name (one row per study).
     default: studies
-
-resources:
-  jobs:
-    study_contacts:
-      name: study_contacts
-      max_concurrent_runs: 1
-      schedule:
-        quartz_cron_expression: "0 0 6 * * ?" # 06:00 UTC daily; paused automatically in dev
-        timezone_id: UTC
-      tasks:
-        - task_key: load_study_contacts
-          spark_python_task:
-            python_file: ./load_study_contacts.py
-            parameters:
-              - --nct-ids
-              - ${var.nct_ids}
-              - --table
-              - clinicaltrials.${var.schema}.${var.table}
-          environment_key: default
-          max_retries: 1
-          min_retry_interval_millis: 300000
-      # Serverless compute. pandas and requests ship with the serverless base environment.
-      # The workspace must allow outbound HTTPS to clinicaltrials.gov.
-      environments:
-        - environment_key: default
-          spec:
-            environment_version: "2"
 
 targets:
   dev:
-    mode: development # prefixes resource names with [dev <user>] and pauses schedules
+    mode: development
     default: true
     workspace:
       host: https://dbc-2831e5fc-ccb1.cloud.databricks.com
 
-  prod:
-    mode: production
-    workspace:
-      host: https://dbc-2831e5fc-ccb1.cloud.databricks.com
-      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+  ## Optionally, there could be 'staging' or 'prod' targets here.
+  #
+  # prod:
+  #   workspace:
+  #     host: https://dbc-2831e5fc-ccb1.cloud.databricks.com
