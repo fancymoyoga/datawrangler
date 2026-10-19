@@ -1,0 +1,30 @@
+# Restored from branch clinicaltrials-001 (commit 3f5973c). Daily job that loads ClinicalTrials.gov
+# studies (from FHIR) into a Unity Catalog Delta table, one row per study with all locations in one
+# column. See load_study_contacts.py for what the task does.
+#
+#   databricks bundle run -t dev study_contacts
+resources:
+  jobs:
+    study_contacts:
+      name: study_contacts
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"  # 06:00 UTC daily; paused automatically in dev
+        timezone_id: UTC
+      tasks:
+        - task_key: load_study_contacts
+          spark_python_task:
+            python_file: ../load_study_contacts.py
+            parameters:
+              - --nct-ids
+              - ${var.fhir_nct_ids}
+              - --table
+              - ${var.fhir_catalog}.${var.fhir_schema}.${var.fhir_table}
+          environment_key: default
+          max_retries: 1
+          min_retry_interval_millis: 300000
+      # Serverless compute. pandas and requests ship with the serverless base environment.
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"

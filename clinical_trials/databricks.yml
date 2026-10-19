@@ -1,0 +1,46 @@
+# This is a Declarative Automation Bundle definition for clinical_trials.
+# The Databricks extension requires databricks.yml configuration file.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
+bundle:
+  name: clinical_trials
+
+include:
+  - resources/*.yml
+
+# Upload only what the jobs need (bundle sync also skips anything in .gitignore).
+sync:
+  exclude:
+    - study_dataframe/**
+    - "**/__pycache__/**"
+
+variables:
+  catalog:
+    description: Unity Catalog catalog for all clinical trials data
+    default: workspace
+  # study_contacts job (FHIR loader)
+  fhir_nct_ids:
+    description: Comma-separated NCT IDs for the study_contacts job to load.
+    default: NCT04280705,NCT05236946,NCT07649629
+  fhir_catalog:
+    description: Catalog for the study_contacts output table (must already exist).
+    default: clinicaltrials
+  fhir_schema:
+    description: Schema for the study_contacts output table (must already exist).
+    default: fhir_studies
+  fhir_table:
+    description: study_contacts output table name (one row per study).
+    default: studies
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-2831e5fc-ccb1.cloud.databricks.com
+
+  ## Optionally, there could be 'staging' or 'prod' targets here.
+  #
+  # prod:
+  #   workspace:
+  #     host: https://dbc-2831e5fc-ccb1.cloud.databricks.com
