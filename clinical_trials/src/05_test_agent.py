@@ -12,6 +12,9 @@
 # COMMAND ----------
 
 # MAGIC %pip install -q "mlflow[databricks]>=3.1" "databricks-sdk>=0.50"
+
+# COMMAND ----------
+
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -21,6 +24,8 @@ import re
 import time
 
 import mlflow
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import NotFound
 from mlflow.tracking import MlflowClient
 
 from pipeline.transforms import EMAIL_PATTERN, PHONE_PATTERN
@@ -32,11 +37,35 @@ DEFAULT_QUESTIONS = " | ".join([
 ])
 
 dbutils.widgets.text("catalog", "workspace")
-dbutils.widgets.text("schema", "clinical_trials")
+dbutils.widgets.text("schema", "")  # blank: use the schema that holds clinical_trials_agent
 dbutils.widgets.text("model_version", "latest")
 dbutils.widgets.text("questions", DEFAULT_QUESTIONS)
 
-MODEL_NAME = f"{dbutils.widgets.get('catalog')}.{dbutils.widgets.get('schema')}.clinical_trials_agent"
+CATALOG = dbutils.widgets.get("catalog").strip()
+SCHEMA = dbutils.widgets.get("schema").strip()
+w = WorkspaceClient()
+
+
+def has_agent(schema):
+    try:
+        w.registered_models.get(f"{CATALOG}.{schema}.clinical_trials_agent")
+        return True
+    except NotFound:
+        return False
+
+
+# Dev mode prefixes the schema (e.g. dev_<user>_clinical_trials), so if the widget is blank or
+# names a schema without the model, look for the one *clinical_trials schema that has it.
+if not SCHEMA or not has_agent(SCHEMA):
+    found = sorted(s.name for s in w.schemas.list(catalog_name=CATALOG)
+                   if s.name.endswith("clinical_trials") and has_agent(s.name))
+    if len(found) != 1:
+        raise RuntimeError(f"clinical_trials_agent not in {CATALOG}.{SCHEMA or '<blank>'}; found it in "
+                           f"{found or 'no schema'}. Set the schema widget, or run clinical_trials_agent_job first")
+    print(f"schema {SCHEMA or '<blank>'} has no clinical_trials_agent; using {found[0]}")
+    SCHEMA = found[0]
+
+MODEL_NAME = f"{CATALOG}.{SCHEMA}.clinical_trials_agent"
 QUESTIONS = [q.strip() for q in dbutils.widgets.get("questions").split("|") if q.strip()]
 
 mlflow.set_registry_uri("databricks-uc")
