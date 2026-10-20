@@ -1,0 +1,12 @@
+resources:
+  pipelines:
+    nyc_taxi_etl:
+      name: nyc_taxi_etl
+      catalog: ${var.catalog}
+      schema: ${resources.schemas.nyc_taxi_schema.name}
+      serverless: true
+      continuous: false
+      root_path: ../src/nyc_taxi_etl
+      libraries:
+        - glob:
+            include: ../src/nyc_taxi_etl/transformations/**

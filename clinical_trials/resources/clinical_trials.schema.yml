@@ -1,0 +1,6 @@
+resources:
+  schemas:
+    clinical_trials:
+      catalog_name: ${var.catalog}
+      name: clinical_trials
+      comment: ClinicalTrials.gov studies - landing, bronze, silver and gold layers

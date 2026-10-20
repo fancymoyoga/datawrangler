@@ -1,0 +1,8 @@
+resources:
+  volumes:
+    landing:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.clinical_trials.name}
+      name: landing
+      volume_type: MANAGED
+      comment: Raw ClinicalTrials.gov API responses, one JSON file per study fetch

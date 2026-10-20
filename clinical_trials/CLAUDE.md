@@ -31,8 +31,10 @@ python fetch_study_fhir.py NCT04280705 --out raw/NCT04280705.fhir.json
 # ...and one row per study (titles, eligibility, locations as JSON) as CSV (needs pandas)
 python fetch_study_fhir.py NCT04280705 --csv raw/NCT04280705_study.csv
 
-# Databricks Asset Bundle (databricks.yml): job `study_contacts` runs load_study_contacts.py
-# and writes one row per study to ${catalog}.${schema}.studies. Needs the Databricks CLI.
+# Databricks Asset Bundle: job `study_contacts` (resources/study_contacts.job.yml) runs
+# load_study_contacts.py and writes one row per study to
+# ${fhir_catalog}.${fhir_schema}.${fhir_table} (clinicaltrials.fhir_studies.studies).
+# The lakehouse jobs are in "Clinical trials lakehouse" below. Needs the Databricks CLI.
 databricks bundle validate -t dev
 databricks bundle deploy -t dev
 databricks bundle run -t dev study_contacts
@@ -42,8 +44,9 @@ cd study_dataframe && python -m venv .venv && .venv/Scripts/python -m pip instal
 .venv/Scripts/python study_dataframe.py NCT04280705 --csv-dir raw
 ```
 
-This folder has no test suite or requirements file yet. Don't invent commands. If you add
-one, record it here.
+The only test suite is `tests/test_transforms.py` (local PySpark test of the pipeline
+transforms; see "Clinical trials lakehouse" below). There's no requirements file for the
+bundle. Don't invent commands. If you add one, record it here.
 
 ## Development rules
 
@@ -359,3 +362,107 @@ derivedSection:
 Note: as written, the `/studies` `fields` pattern doesn't group its alternation:
 `^(A)|(@query)$`. Validate each item with `re.fullmatch` against
 `[a-zA-Z][a-zA-Z0-9\-. ]*|@query` so the anchors apply to both alternatives.
+
+---
+
+# Clinical trials lakehouse
+
+## Goal
+
+Ingest clinical trial records from the ClinicalTrials.gov v2 API into a medallion lakehouse on
+Databricks. The gold table feeds an AI model.
+
+- Source: `GET /studies?query.cond=<condition>` (default `lung cancer`), paged, capped at
+  `max_studies` per run (default 100)
+- Layers: bronze (raw) → silver (validated, deduplicated, PII-tagged) → gold (PII-free, AI-ready)
+
+## Constraints
+
+- **Databricks Free Edition**: serverless compute only. Never add cluster configs
+  (`new_cluster`, `job_clusters`, `clusters`, instance pools, `node_type_id`).
+  Pipelines use `serverless: true`; job tasks use serverless environments.
+- **Catalog**: `workspace`.
+- **Packaging**: everything is a Databricks Asset Bundle (`databricks.yml` + `resources/`).
+  The `dev` target uses `mode: development`. `databricks.yml` must keep
+  `include: resources/*.yml`: without it a deploy deletes every resource defined there.
+- **Bundle-owned storage**: the schema `clinical_trials` and the managed volume `landing` are
+  bundle resources. Always reference them by resource interpolation, never by literal name, so
+  dev-mode prefixes (`dev_<user>_clinical_trials`) flow through:
+  - schema: `${resources.schemas.clinical_trials.name}`
+  - volume: `${resources.volumes.landing.name}`
+  - landing path: `/Volumes/${var.catalog}/${resources.schemas.clinical_trials.name}/${resources.volumes.landing.name}/studies`
+- **Transformations**: Lakeflow Spark Declarative Pipelines (SDP), modern API
+  (`from pyspark import pipelines as dp`), not legacy `dlt`.
+- Workspace profile: `monicaenders` (`https://dbc-2831e5fc-ccb1.cloud.databricks.com`).
+  Pass `--profile monicaenders` on every CLI call.
+
+## As built
+
+- **Landing** (`src/ctgov_client.py`, run by `src/01_ingest_api.py`): searches `/studies` with
+  `query.cond`, `fields=protocolSection|hasResults`, `sort=@relevance`, `pageSize=100`, follows
+  `nextPageToken` with the first page's parameters unchanged, and checks `/version` each run.
+  Each study lands as its own envelope at `<volume>/studies/{NCT_ID}/{yyyyMMddTHHmmssZ}_{NCT_ID}.json`:
+  `requested_nct_id, source_url, http_status, ingested_at, ingest_id, payload, query`, where
+  `payload` is the study object (same shape as `/studies/{nctId}`). A failed page lands under
+  `QUERY_ERROR/` and stops paging; a study without a valid NCT ID lands under `NO_NCT_ID/`.
+  Files are written as `_*.tmp` and renamed, so Auto Loader never sees partial files.
+  Retries 429/5xx with backoff; if the API is unreachable, `scripts/fetch_and_upload.py`
+  does the same search locally and uploads with `databricks fs cp`.
+- **Bronze** `bronze_studies_raw`: Auto Loader `binaryFile`, so nothing is parsed or dropped.
+- **Silver**: `silver_studies_validated` (critical rules via `expect_all_or_drop`, warnings via
+  `expect_all`), `silver_studies_quarantine` (same parse, `failed_rules` array),
+  `silver_studies` (one row per study: newest `last_update_posted_date`, then `ingested_at`),
+  `silver_study_contacts` (PII), `silver_study_locations`. Rules live in
+  `src/pipeline/transforms.py`; NULL rule results count as failures.
+  Known gap: the `known_overall_status` rule hard-codes the status list instead of loading
+  `/studies/enums` (development rule 9).
+- **PII tagging** (`src/02_tag_pii.py`): UC column tags `pii` / `pii_type` / `pii_detection`,
+  table tag `contains_pii`, audit in `pii_tag_audit`. Removes tags a run no longer confirms and
+  skips pipeline-internal `__materialization_*` tables. Fails the run on direct identifiers in gold.
+- **Gold** `gold_study_documents`: allow-listed columns only; free text and `document_text`
+  scrubbed of emails/phones; rows under 200 chars dropped; CDF on.
+- **Vector Search** (`src/03_vector_index.py`): Free Edition can't index materialized views, so gold
+  is merged into the Delta table `gold_study_documents_vs_source`, and the Delta Sync index
+  `gold_study_documents_index` (endpoint `clinical-trials-vs`, `databricks-gte-large-en`) syncs from it.
+- **Agent** (`src/agent/agent.py`, MLflow `ResponsesAgent`): retrieves from the gold index, answers
+  with `databricks-meta-llama-3-3-70b-instruct`, registered as `<schema>.clinical_trials_agent`.
+  Declared resources are the gold index and the two model endpoints only, never silver.
+  `src/04_log_agent.py` logs and tests it; `src/05_test_agent.py` asks it questions.
+
+## Layout
+
+```
+clinical_trials/
+├── databricks.yml                     # bundle, variables, sync excludes, dev target
+├── resources/
+│   ├── clinical_trials.schema.yml     # schema clinical_trials
+│   ├── landing.volume.yml             # managed volume landing
+│   ├── clinical_trials.pipeline.yml   # SDP pipeline (serverless, triggered)
+│   ├── clinical_trials.job.yml        # ingest → pipeline → tag PII → sync vector index
+│   ├── clinical_trials_agent.job.yml  # log, register and test the agent
+│   └── study_contacts.job.yml         # FHIR loader (load_study_contacts.py)
+├── src/
+│   ├── ctgov_client.py                # stdlib search client + envelope writer (shared)
+│   ├── 01_ingest_api.py … 05_test_agent.py
+│   ├── agent/agent.py                 # ResponsesAgent
+│   └── pipeline/                      # bronze.py, silver.py, gold.py, transforms.py
+├── scripts/fetch_and_upload.py        # local fallback if compute can't reach the API
+├── tests/test_transforms.py           # local PySpark test of transforms
+├── load_study_contacts.py, fetch_study_fhir.py, study_dataframe/, explore_study_fhir.ipynb
+```
+
+## Lakehouse commands
+
+```
+databricks bundle validate --strict -t dev --profile monicaenders
+databricks bundle plan -t dev --profile monicaenders     # check for unexpected deletes first
+databricks bundle deploy -t dev --profile monicaenders
+databricks bundle run clinical_trials_job -t dev --profile monicaenders
+databricks bundle run clinical_trials_agent_job -t dev --profile monicaenders
+
+# Local transform test: needs PySpark 4.0+, Java 17+, Python <= 3.13
+python tests/test_transforms.py
+```
+
+Deploying deletes any resource in this bundle's state that isn't in the config. Run
+`databricks bundle plan` before every deploy and stop if it shows a delete you didn't intend.

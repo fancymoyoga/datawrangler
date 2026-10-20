@@ -1,0 +1,40 @@
+resources:
+  jobs:
+    clinical_trials_job:
+      name: clinical_trials_job
+      max_concurrent_runs: 1
+      # Serverless: no cluster config anywhere (Free Edition).
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${resources.schemas.clinical_trials.name}
+        - name: condition
+          # ClinicalTrials.gov query.cond search (Essie syntax)
+          default: lung cancer
+        - name: max_studies
+          default: "100"
+        - name: landing_path
+          # Must match the pipeline's landing_path configuration.
+          default: /Volumes/${var.catalog}/${resources.schemas.clinical_trials.name}/${resources.volumes.landing.name}/studies
+        - name: use_ai_pii_check
+          default: "true"
+      tasks:
+        - task_key: ingest_api
+          notebook_task:
+            notebook_path: ../src/01_ingest_api.py
+        - task_key: run_pipeline
+          depends_on:
+            - task_key: ingest_api
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.clinical_trials_pipeline.id}
+        - task_key: tag_pii
+          depends_on:
+            - task_key: run_pipeline
+          notebook_task:
+            notebook_path: ../src/02_tag_pii.py
+        - task_key: sync_vector_index
+          depends_on:
+            - task_key: tag_pii
+          notebook_task:
+            notebook_path: ../src/03_vector_index.py

@@ -1,0 +1,18 @@
+resources:
+  jobs:
+    clinical_trials_agent_job:
+      name: clinical_trials_agent_job
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${resources.schemas.clinical_trials.name}
+        - name: llm_endpoint
+          default: databricks-meta-llama-3-3-70b-instruct
+        - name: embedding_endpoint
+          default: databricks-gte-large-en
+      tasks:
+        - task_key: log_and_test_agent
+          notebook_task:
+            notebook_path: ../src/04_log_agent.py

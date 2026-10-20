@@ -1,0 +1,20 @@
+bundle:
+  name: nyc_taxi_pipeline
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Catalog that holds the pipeline's tables
+    default: workspace
+  schema:
+    description: Schema that holds the pipeline's tables
+    default: nyc_taxi
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-2831e5fc-ccb1.cloud.databricks.com

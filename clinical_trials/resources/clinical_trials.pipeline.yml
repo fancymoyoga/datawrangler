@@ -1,0 +1,20 @@
+resources:
+  pipelines:
+    clinical_trials_pipeline:
+      name: clinical_trials_pipeline
+      catalog: ${var.catalog}
+      schema: ${resources.schemas.clinical_trials.name}
+      serverless: true
+      continuous: false
+      # root_path is on sys.path, so bronze/silver/gold can `import transforms`.
+      root_path: ../src/pipeline
+      libraries:
+        - file:
+            path: ../src/pipeline/bronze.py
+        - file:
+            path: ../src/pipeline/silver.py
+        - file:
+            path: ../src/pipeline/gold.py
+      configuration:
+        # Keep in sync with the job's landing_path parameter.
+        landing_path: /Volumes/${var.catalog}/${resources.schemas.clinical_trials.name}/${resources.volumes.landing.name}/studies
