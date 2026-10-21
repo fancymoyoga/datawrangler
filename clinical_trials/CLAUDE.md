@@ -411,8 +411,9 @@ Databricks. The gold table feeds an AI model.
 - **Bronze** `bronze_studies_raw`: Auto Loader `binaryFile`, so nothing is parsed or dropped.
 - **Silver**: `silver_studies_validated` (critical rules via `expect_all_or_drop`, warnings via
   `expect_all`), `silver_studies_quarantine` (same parse, `failed_rules` array),
-  `silver_studies` (one row per study: newest `last_update_posted_date`, then `ingested_at`),
-  `silver_study_contacts` (PII), `silver_study_locations`. Rules live in
+  `silver_studies` (Auto CDC SCD Type 1 streaming table from validated, keyed on `nct_id`,
+  sequenced by `struct(last_update_posted_date, ingested_at)`; keeps `payload` for the child
+  tables), `silver_study_contacts` (PII), `silver_study_locations`. Rules live in
   `src/pipeline/transforms.py`; NULL rule results count as failures.
   Known gap: the `known_overall_status` rule hard-codes the status list instead of loading
   `/studies/enums` (development rule 9).

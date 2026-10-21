@@ -229,25 +229,17 @@ def apply_critical_rules(parsed: DataFrame) -> DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def latest_versions(validated_df: DataFrame) -> DataFrame:
-    """One row per nct_id: newest last_update_posted_date, then newest ingested_at."""
-    by_study = Window.partitionBy("nct_id")
-    newest_first = by_study.orderBy(
-        F.col("last_update_posted_date").desc_nulls_last(), F.col("ingested_at").desc_nulls_last()
-    )
-    return (
-        validated_df.withColumns({
-            "_rank": F.row_number().over(newest_first),
-            "times_pulled": F.count(F.lit(1)).over(by_study),
-            "distinct_versions": F.size(F.collect_set("payload_hash").over(by_study)),
-        })
-        .where("_rank = 1")
-        .drop("_rank")
-    )
+# silver_studies is an Auto CDC (SCD Type 1) target fed by silver_studies_validated: one row per
+# nct_id, the newest last_update_posted_date winning, then the newest ingested_at.
+CDC_KEYS = ["nct_id"]
+CDC_SEQUENCE = ["last_update_posted_date", "ingested_at"]
 
 
-def current_studies(latest: DataFrame) -> DataFrame:
-    return latest.drop("payload")
+def apply_scd1(changes: DataFrame) -> DataFrame:
+    """What the SCD Type 1 Auto CDC flow keeps (newest row per key); used by local tests."""
+    newest_first = Window.partitionBy(*CDC_KEYS).orderBy(
+        *[F.col(c).desc_nulls_last() for c in CDC_SEQUENCE])
+    return changes.withColumn("_rank", F.row_number().over(newest_first)).where("_rank = 1").drop("_rank")
 
 
 PERSON_TYPE = "array<struct<name:string,role:string,phone:string,phoneExt:string,email:string,affiliation:string>>"

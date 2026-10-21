@@ -191,10 +191,9 @@ def main():
     parsed = t.parse_studies(bronze).cache()
     validated = t.apply_critical_rules(t.validated(parsed)).cache()
     quarantine = t.quarantine(parsed)
-    latest = t.latest_versions(validated).cache()
-    studies = t.current_studies(latest)
-    contacts = t.contacts(latest)
-    locations = t.locations(latest)
+    studies = t.apply_scd1(validated).cache()
+    contacts = t.contacts(studies)
+    locations = t.locations(studies)
     gold_all = t.documents(studies).cache()
     gold = gold_all.where(" AND ".join(t.GOLD_RULES.values()))
 
@@ -206,7 +205,7 @@ def main():
     show("silver_studies_quarantine", quarantine, "requested_nct_id", "nct_id", "http_status",
          "failed_rules", F.substring("raw_json_snippet", 1, 50).alias("raw_json_snippet"), truncate=False)
     show("silver_studies", studies, "nct_id", "overall_status", "start_date", "completion_date",
-         "last_update_posted_date", "times_pulled", "distinct_versions", "minimum_age",
+         "last_update_posted_date", "ingested_at", "minimum_age",
          "minimum_age_years", "maximum_age", "maximum_age_years", truncate=False)
     show("silver_studies (arrays)", studies, "nct_id", "phases", "intervention_names",
          "intervention_types", "primary_outcome_measures", "responsible_party_investigator_name")
@@ -231,8 +230,7 @@ def main():
     s = {r["nct_id"]: r for r in studies.collect()}
     assert set(s) == {"NCT00000001", "NCT00000006", "NCT00000007"}
     one = s["NCT00000001"]
-    assert (one["overall_status"], one["times_pulled"], one["distinct_versions"]) == (
-        "ACTIVE_NOT_RECRUITING", 3, 2)
+    assert one["overall_status"] == "ACTIVE_NOT_RECRUITING"  # newest of 3 pulls (2 versions)
     assert str(one["start_date"]) == "2018-05-01" and str(one["completion_date"]) == "2023-12-01"
     assert one["minimum_age_years"] == 18.0 and one["dq_warnings"] == []
     six = s["NCT00000006"]
