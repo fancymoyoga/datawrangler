@@ -1,0 +1,79 @@
+# Full rebuild, run on demand: CSVs in the bronze volume -> bronze -> silver
+# (+ quality checks and PHI masks) -> gold features -> train -> score ->
+# AI care recommendations -> care-queue views -> app grants.
+# The SQL in src/sql was recovered from the original hand-run build.
+resources:
+  jobs:
+    cascade_build:
+      name: Cascade full build
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+      environments:
+        - environment_key: default
+          spec:
+            client: "3"
+      tasks:
+        - task_key: schemas
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ../src/sql/00_schemas.sql
+        - task_key: bronze
+          depends_on: [{task_key: schemas}]
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ../src/sql/01_bronze.sql
+        - task_key: silver
+          depends_on: [{task_key: bronze}]
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ../src/sql/02_silver.sql
+        - task_key: data_quality
+          depends_on: [{task_key: bronze}]
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ../src/sql/03_data_quality.sql
+        - task_key: governance
+          depends_on: [{task_key: silver}]
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ../src/sql/04_governance.sql
+        - task_key: gold_discharges
+          depends_on: [{task_key: silver}]
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ../src/sql/05_gold_discharges.sql
+        - task_key: train_model
+          depends_on: [{task_key: gold_discharges}]
+          environment_key: default
+          notebook_task:
+            notebook_path: ../src/notebooks/06_train_readmission_model.py
+        - task_key: score_discharges
+          depends_on: [{task_key: train_model}]
+          environment_key: default
+          notebook_task:
+            notebook_path: ../src/notebooks/07_score_discharges.py
+        - task_key: care_recommendations
+          depends_on: [{task_key: score_discharges}]
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ../src/sql/08_care_recommendations.sql
+        - task_key: gold_views
+          depends_on: [{task_key: care_recommendations}]
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ../src/sql/09_gold_views.sql
+        - task_key: app_grants
+          depends_on: [{task_key: gold_views}, {task_key: governance}]
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ../src/sql/10_app_grants.sql

@@ -1,0 +1,385 @@
+{
+  "datasets": [
+    {
+      "displayName": "High-Risk Readmission Patients",
+      "name": "high_risk_patients",
+      "queryLines": [
+        "WITH latest AS (\n",
+        "  SELECT\n",
+        "    MAX(discharge_date) AS max_date\n",
+        "  FROM\n",
+        "    cascade_health.cascade_gold.readmission_risk_scores\n",
+        ")\n",
+        "SELECT\n",
+        "  s.patient_id,\n",
+        "  p.first_name,\n",
+        "  p.last_name,\n",
+        "  d.age_at_admission,\n",
+        "  d.primary_diagnosis,\n",
+        "  d.discharge_date,\n",
+        "  ROUND(s.risk_score, 2) AS risk_score,\n",
+        "  s.top_3_reasons,\n",
+        "  r.care_recommendation,\n",
+        "  CEIL(COUNT(*) OVER () / 60.0) AS care_managers_needed\n",
+        "FROM\n",
+        "  cascade_health.cascade_gold.readmission_risk_scores s\n",
+        "    JOIN cascade_health.cascade_gold.patient_discharges d\n",
+        "      ON s.encounter_id = d.encounter_id\n",
+        "    JOIN cascade_health.cascade_silver.patients p\n",
+        "      ON s.patient_id = p.patient_id\n",
+        "    LEFT JOIN cascade_health.cascade_gold.care_recommendations r\n",
+        "      ON s.encounter_id = r.encounter_id\n",
+        "    CROSS JOIN latest\n",
+        "WHERE\n",
+        "  s.risk_tier = 'High'\n",
+        "  AND s.discharge_date > date_sub(latest.max_date, 7)\n",
+        "ORDER BY\n",
+        "  s.risk_score DESC"
+      ]
+    },
+    {
+      "config": {
+        "dimensions": [
+          {
+            "expr": "source.*"
+          }
+        ],
+        "measures": [
+          {
+            "comment": "Represents the total number of rows in the dataset. Use this measure to count all",
+            "displayName": "Count",
+            "expr": "COUNT(*)",
+            "name": "count"
+          }
+        ],
+        "source": "SELECT risk_tier,\r\n       COUNT(*) AS discharges,\r\n       ROUND(AVG(d.readmitted_30d) * 100, 0) AS pct_readmitted\r\nFROM cascade_health.cascade_gold.readmission_risk_scores s\r\nJOIN cascade_health.cascade_gold.patient_discharges d USING (encounter_id)\r\nGROUP BY risk_tier",
+        "version": "1.1"
+      },
+      "displayName": "High Risk This Week",
+      "name": "33a53544"
+    }
+  ],
+  "pages": [
+    {
+      "displayName": "High-Risk Patients",
+      "layout": [
+        {
+          "position": {
+            "height": 1,
+            "width": 12,
+            "x": 0,
+            "y": 0
+          },
+          "widget": {
+            "multilineTextboxSpec": {
+              "lines": [
+                "## High-Risk Readmission Patients — Latest 7 Days\n",
+                "High-tier patients discharged in the most recent week, sorted by predicted 30-day readmission probability."
+              ]
+            },
+            "name": "header_text"
+          }
+        },
+        {
+          "position": {
+            "height": 2,
+            "width": 4,
+            "x": 0,
+            "y": 1
+          },
+          "widget": {
+            "name": "counter_total_patients",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "high_risk_patients",
+                  "disaggregated": false,
+                  "fields": [
+                    {
+                      "expression": "COUNT(DISTINCT `patient_id`)",
+                      "name": "countdistinct(patient_id)"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "countdistinct(patient_id)",
+                  "rowNumber": 0
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": {
+                  "fields": [],
+                  "value": "High-Risk Patients This Week"
+                }
+              },
+              "version": 2,
+              "widgetType": "counter"
+            }
+          }
+        },
+        {
+          "position": {
+            "height": 2,
+            "width": 4,
+            "x": 4,
+            "y": 1
+          },
+          "widget": {
+            "name": "counter_avg_risk",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "high_risk_patients",
+                  "disaggregated": false,
+                  "fields": [
+                    {
+                      "expression": "SUM(`care_managers_needed`)",
+                      "name": "sum(care_managers_needed)"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(care_managers_needed)",
+                  "rowNumber": 0
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": {
+                  "fields": [],
+                  "value": "Care Managers Needed"
+                }
+              },
+              "version": 2,
+              "widgetType": "counter"
+            }
+          }
+        },
+        {
+          "position": {
+            "height": 2,
+            "width": 4,
+            "x": 8,
+            "y": 1
+          },
+          "widget": {
+            "name": "counter_max_risk",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "high_risk_patients",
+                  "disaggregated": false,
+                  "fields": [
+                    {
+                      "expression": "MAX(`risk_score`)",
+                      "name": "max(risk_score)"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "max(risk_score)",
+                  "rowNumber": 0
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Highest Risk Score"
+              },
+              "version": 2,
+              "widgetType": "counter"
+            }
+          }
+        },
+        {
+          "position": {
+            "height": 8,
+            "width": 12,
+            "x": 0,
+            "y": 6
+          },
+          "widget": {
+            "name": "patient_table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "high_risk_patients",
+                  "disaggregated": true,
+                  "fields": [
+                    {
+                      "expression": "`patient_id`",
+                      "name": "patient_id"
+                    },
+                    {
+                      "expression": "`first_name`",
+                      "name": "first_name"
+                    },
+                    {
+                      "expression": "`last_name`",
+                      "name": "last_name"
+                    },
+                    {
+                      "expression": "`age_at_admission`",
+                      "name": "age_at_admission"
+                    },
+                    {
+                      "expression": "`primary_diagnosis`",
+                      "name": "primary_diagnosis"
+                    },
+                    {
+                      "expression": "`discharge_date`",
+                      "name": "discharge_date"
+                    },
+                    {
+                      "expression": "`risk_score`",
+                      "name": "risk_score"
+                    },
+                    {
+                      "expression": "`top_3_reasons`",
+                      "name": "top_3_reasons"
+                    },
+                    {
+                      "expression": "`care_recommendation`",
+                      "name": "care_recommendation"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "patient_id"
+                  },
+                  {
+                    "fieldName": "first_name"
+                  },
+                  {
+                    "fieldName": "last_name"
+                  },
+                  {
+                    "fieldName": "age_at_admission"
+                  },
+                  {
+                    "fieldName": "primary_diagnosis"
+                  },
+                  {
+                    "fieldName": "discharge_date"
+                  },
+                  {
+                    "fieldName": "risk_score"
+                  },
+                  {
+                    "fieldName": "top_3_reasons"
+                  },
+                  {
+                    "fieldName": "care_recommendation"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "High-Risk Patient Details"
+              },
+              "version": 2,
+              "widgetType": "table"
+            }
+          }
+        },
+        {
+          "position": {
+            "height": 3,
+            "width": 12,
+            "x": 0,
+            "y": 3
+          },
+          "widget": {
+            "name": "readmission-rate-by-risk-tier",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "33a53544",
+                  "disaggregated": false,
+                  "fields": [
+                    {
+                      "expression": "`risk_tier`",
+                      "name": "risk_tier"
+                    },
+                    {
+                      "expression": "AVG(`pct_readmitted`)",
+                      "name": "avg(pct_readmitted)"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "risk_tier",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "avg(pct_readmitted)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Readmission Rate by Risk Tier"
+              },
+              "version": 3,
+              "widgetType": "bar"
+            }
+          }
+        }
+      ],
+      "layoutVersion": "GRID_V1",
+      "name": "2f88b7a2",
+      "pageType": "PAGE_TYPE_CANVAS"
+    }
+  ],
+  "uiSettings": {
+    "applyModeEnabled": false,
+    "theme": {
+      "widgetHeaderAlignment": "ALIGNMENT_UNSPECIFIED"
+    }
+  }
+}

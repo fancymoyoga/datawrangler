@@ -1,0 +1,20 @@
+resources:
+  apps:
+    care_managers:
+      name: care-managers
+      description: 'Cascade Care Queue: care managers work their high-risk discharge list'
+      source_code_path: ../src/app
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+        - database:
+            database_name: databricks_postgres
+            instance_name: cascade-care
+            permission: CAN_CONNECT_AND_CREATE
+          name: database
+        - name: assistant-model
+          serving_endpoint:
+            name: databricks-meta-llama-3-3-70b-instruct
+            permission: CAN_QUERY

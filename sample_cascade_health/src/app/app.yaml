@@ -1,0 +1,12 @@
+command: ["streamlit", "run", "app.py"]
+env:
+  - name: CASCADE_CATALOG
+    value: cascade_health
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse
+  - name: LAKEBASE_INSTANCE
+    value: cascade-care
+  - name: ASSISTANT_MODEL
+    valueFrom: assistant-model
+  - name: DEMO_TODAY
+    value: "2026-09-01"

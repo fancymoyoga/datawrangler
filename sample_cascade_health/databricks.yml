@@ -1,0 +1,33 @@
+# Cascade Health readmission-risk pilot.
+# Wraps the notebooks, job, dashboard and app that were first built by hand
+# in the workspace, so they can be versioned and redeployed.
+bundle:
+  name: sample_cascade_health
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog for all Cascade Health data
+    default: cascade_health
+  bronze_schema:
+    default: cascade_bronze
+  silver_schema:
+    default: cascade_silver
+  gold_schema:
+    default: cascade_gold
+  send_email:
+    description: Whether the daily job really emails care managers. Off unless a target turns it on.
+    default: "false"
+  warehouse_id:
+    description: SQL warehouse for the dashboard and app
+    lookup:
+      warehouse: Serverless Starter Warehouse
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      profile: monicaenders

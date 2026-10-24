@@ -1,0 +1,45 @@
+resources:
+  jobs:
+    cascade_daily_care_queue:
+      name: Cascade daily care queue
+      tasks:
+        - task_key: score_discharges
+          disabled: false
+          email_notifications: {}
+          environment_key: default
+          notebook_task:
+            notebook_path: ../src/notebooks/07_score_discharges.py
+            source: WORKSPACE
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+        - task_key: notify_care_managers
+          depends_on:
+            - task_key: score_discharges
+          disabled: false
+          email_notifications: {}
+          environment_key: default
+          notebook_task:
+            notebook_path: ../src/notebooks/11_notify_care_managers.py
+            source: WORKSPACE
+          run_if: ALL_SUCCESS
+          timeout_seconds: 0
+      description: 'Daily: score every discharge for readmission risk, then email each care manager their count of new high-risk patients (no patient details).'
+      email_notifications: {}
+      environments:
+        - environment_key: default
+          spec:
+            client: "3"
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: send_email
+          default: ${var.send_email}
+      queue:
+        enabled: true
+      schedule:
+        pause_status: UNPAUSED
+        quartz_cron_expression: 0 0 6 * * ?
+        timezone_id: America/Los_Angeles
+      timeout_seconds: 0
+      webhook_notifications: {}
