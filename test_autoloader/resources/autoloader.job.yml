@@ -1,0 +1,27 @@
+resources:
+  jobs:
+    autoloader_job:
+      name: autoloader_job
+      max_concurrent_runs: 1
+      # Serverless: no cluster config anywhere (Free Edition).
+      performance_target: STANDARD
+      tags:
+        aidevkit_project: ai-dev-kit
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${resources.schemas.autoloader.name}
+        - name: source_path
+          default: ${var.source_path}
+        - name: checkpoint_root
+          default: /Volumes/${var.catalog}/${resources.schemas.autoloader.name}/${resources.volumes.checkpoints.name}
+      tasks:
+        - task_key: load_files
+          notebook_task:
+            notebook_path: ../src/load_files.py
+        - task_key: flatten_studies
+          depends_on:
+            - task_key: load_files
+          notebook_task:
+            notebook_path: ../src/flatten_studies.py

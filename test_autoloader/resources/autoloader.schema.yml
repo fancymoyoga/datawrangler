@@ -1,0 +1,6 @@
+resources:
+  schemas:
+    autoloader:
+      catalog_name: ${var.catalog}
+      name: autoloader
+      comment: Bronze tables loaded by Auto Loader from the clinical_trials landing volume
