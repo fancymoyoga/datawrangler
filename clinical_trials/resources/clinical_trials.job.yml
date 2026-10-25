@@ -13,7 +13,11 @@ resources:
           # ClinicalTrials.gov query.cond search (Essie syntax)
           default: lung cancer
         - name: max_studies
-          default: "100"
+          # Blank lands every match. A capped run never starts incremental pulls.
+          default: ""
+        - name: incremental
+          # true: after a complete run, fetch only studies updated since it (see ingest_runs)
+          default: "true"
         - name: landing_path
           # Must match the pipeline's landing_path configuration.
           default: /Volumes/${var.catalog}/${resources.schemas.clinical_trials.name}/${resources.volumes.landing.name}/studies

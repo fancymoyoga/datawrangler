@@ -6,10 +6,14 @@ compute cannot reach the API. Stdlib only.
 
     python scripts/fetch_and_upload.py --profile monicaenders \
         --landing-path /Volumes/workspace/dev_monica_enders_clinical_trials/landing/studies \
-        --condition "lung cancer" --max-studies 100
+        --condition "lung cancer" [--max-studies 100] [--updated-since 2026-10-01]
+
+Without --max-studies it lands every match. It doesn't record runs in ingest_runs, so pass
+--updated-since yourself for an incremental pull.
 """
 
 import argparse
+import datetime
 import os
 import shutil
 import subprocess
@@ -39,7 +43,9 @@ def upload(local_dir, landing_path, profile):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--condition", default="lung cancer", help="condition to search (query.cond)")
-    parser.add_argument("--max-studies", type=int, default=100, help="cap on studies landed")
+    parser.add_argument("--max-studies", type=int, help="cap on studies landed (default: every match)")
+    parser.add_argument("--updated-since", type=datetime.date.fromisoformat,
+                        help="only studies whose last update was posted on or after this YYYY-MM-DD date")
     parser.add_argument("--landing-path", required=True, help="/Volumes/<catalog>/<schema>/<volume>/<folder>")
     parser.add_argument("--profile", help="Databricks CLI profile (required unless --no-upload)")
     parser.add_argument("--out-dir", help="keep the local files here (default: a temp dir, deleted after upload)")
@@ -54,13 +60,14 @@ def main():
 
     out_dir = args.out_dir or tempfile.mkdtemp(prefix="ctgov_landing_")
     try:
-        result, unreachable = fetch_search(args.condition, out_dir, args.max_studies)
+        result, unreachable = fetch_search(args.condition, out_dir, args.max_studies, args.updated_since)
         if unreachable:
             print(f"ERROR: API unreachable from this machine too: {unreachable}", file=sys.stderr)
         if result["written"] and not args.no_upload:
             upload(out_dir, landing_path, args.profile)
-        print(f"{len(result['written'])} studies landed of {result['total_count']} matching "
-              f"in {result['pages']} page(s)")
+        print(f"{result['studies']} studies landed of {result['total_count']} matching "
+              f"in {len(result['written'])} file(s) from {result['pages']} page(s)"
+              + ("" if result["complete"] else "; search not complete"))
         if args.no_upload or args.out_dir:
             print(f"local files in {out_dir}")
     finally:

@@ -399,17 +399,24 @@ Databricks. The gold table feeds an AI model.
 ## As built
 
 - **Landing** (`src/ctgov_client.py`, run by `src/01_ingest_api.py`): searches `/studies` with
-  `query.cond`, `fields=protocolSection|hasResults`, `sort=@relevance`, `pageSize=100`, follows
+  `query.cond`, `fields=protocolSection|hasResults`, `sort=@relevance`, `pageSize=1000`, follows
   `nextPageToken` with the first page's parameters unchanged, and checks `/version` each run.
-  Each study lands as its own envelope at `<volume>/studies/{NCT_ID}/{yyyyMMddTHHmmssZ}_{NCT_ID}.json`:
-  `requested_nct_id, source_url, http_status, ingested_at, ingest_id, payload, query`, where
-  `payload` is the study object (same shape as `/studies/{nctId}`). A failed page lands under
-  `QUERY_ERROR/` and stops paging; a study without a valid NCT ID lands under `NO_NCT_ID/`.
-  Files are written as `_*.tmp` and renamed, so Auto Loader never sees partial files.
-  Retries 429/5xx with backoff; if the API is unreachable, `scripts/fetch_and_upload.py`
-  does the same search locally and uploads with `databricks fs cp`.
+  Each page lands as one envelope (about 12 MB for 1,000 studies) at
+  `<volume>/studies/search/{yyyyMMddTHHmmssZ}_{ingest_id[:8]}_page{nnnn}.json`:
+  `source_url, http_status, ingested_at, ingest_id, query, page, payload`, where `payload` is the
+  page (`studies`, `nextPageToken`, `totalCount`). A failed page is landed with its error body and
+  stops paging; empty pages aren't landed. Files are written as `_*.tmp` and renamed, so Auto
+  Loader never sees partial files. Retries 429/5xx with backoff; if the API is unreachable,
+  `scripts/fetch_and_upload.py` does the same search locally and uploads with `databricks fs cp`.
+  Older single-study envelopes (`{NCT_ID}/...json`, with `requested_nct_id`) still parse.
+- **Incremental pulls**: `01_ingest_api.py` records every run in `ingest_runs` (`complete` = the
+  search reached its last page with no error or cap). With `incremental=true`, a condition that has
+  a complete run is searched with `filter.advanced=AREA[LastUpdatePostDate]RANGE[<that run's UTC
+  date - 1 day>,MAX]`; the day of overlap covers US-dated updates posted after the run. Blank
+  `max_studies` lands every match; a capped run is never complete. `incremental=false` re-fetches all.
 - **Bronze** `bronze_studies_raw`: Auto Loader `binaryFile`, so nothing is parsed or dropped.
-- **Silver**: `silver_studies_validated` (critical rules via `expect_all_or_drop`, warnings via
+  One row per landed file (a page or a single study).
+- **Silver**: page envelopes are split into one row per study. `silver_studies_validated` (critical rules via `expect_all_or_drop`, warnings via
   `expect_all`), `silver_studies_quarantine` (same parse, `failed_rules` array),
   `silver_studies` (Auto CDC SCD Type 1 streaming table from validated, keyed on `nct_id`,
   sequenced by `struct(last_update_posted_date, ingested_at)`; keeps `payload` for the child

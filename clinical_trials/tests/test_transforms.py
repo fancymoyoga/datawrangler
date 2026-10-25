@@ -23,7 +23,7 @@ from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
 
 import transforms as t  # noqa: E402
-from ctgov_client import build_envelope, write_envelope  # noqa: E402
+from ctgov_client import build_envelope, land_page, write_envelope  # noqa: E402
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -145,6 +145,16 @@ def build_landing(root):
     with open(os.path.join(folder, "20261001T120000Z_NCT00000008.json"), "w") as f:
         f.write('{"requested_nct_id": "NCT00000008", "http_status": 200, "payload": {"protocolSe')
 
+    # Search pages, as the ingest job lands them: page 1 has a new study and a later pull of
+    # NCT00000001's version 2; page 2 is an empty page; page 3 is an API error.
+    at = T0 + timedelta(minutes=30)
+    url = "https://clinicaltrials.gov/api/v2/studies?query.cond=test"
+    query = {"query.cond": "test"}
+    land_page(root, url, 200, {"studies": [study("NCT00000009"), copy.deepcopy(v2)],
+                               "nextPageToken": "abc"}, at, "run-30-search", query, 1)
+    land_page(root, url, 200, {"studies": [], "nextPageToken": "def"}, at, "run-30-search", query, 2)
+    land_page(root, url, 400, b"pageToken is invalid", at, "run-30-search", query, 3)
+
 
 def binary_files(spark, root):
     """Rows shaped like the binaryFile source (Auto Loader's input to bronze).
@@ -220,16 +230,21 @@ def main():
 
     # --- assertions -------------------------------------------------------
     q = {r["requested_nct_id"]: set(r["failed_rules"]) for r in quarantine.collect()}
-    assert set(q) == {"NCT00000404", "NCT00000002", "NCT00000005", "NCT00000008"}, q
+    assert set(q) == {"NCT00000404", "NCT00000002", "NCT00000005", "NCT00000008", None}, q
     assert "http_status_200" in q["NCT00000404"]
+    assert "http_status_200" in q[None]  # the failed search page
     assert q["NCT00000002"] == {"nct_id_matches_request"}
     assert q["NCT00000005"] == {"title_present"}
     assert "valid_json" in q["NCT00000008"]
-    assert bronze.count() == parsed.count() == validated.count() + quarantine.count()
+    assert bronze.count() == 12  # 9 single-study files + 3 search pages
+    # The first page splits into 2 study rows and the empty page into none.
+    assert parsed.count() == bronze.count() == validated.count() + quarantine.count()
 
     s = {r["nct_id"]: r for r in studies.collect()}
-    assert set(s) == {"NCT00000001", "NCT00000006", "NCT00000007"}
+    assert set(s) == {"NCT00000001", "NCT00000006", "NCT00000007", "NCT00000009"}
     one = s["NCT00000001"]
+    assert one["ingest_id"] == "run-30-search"  # same version; the later pull (from a page) wins
+    assert s["NCT00000009"]["requested_nct_id"] == "NCT00000009"
     assert one["overall_status"] == "ACTIVE_NOT_RECRUITING"  # newest of 3 pulls (2 versions)
     assert str(one["start_date"]) == "2018-05-01" and str(one["completion_date"]) == "2023-12-01"
     assert one["minimum_age_years"] == 18.0 and one["dq_warnings"] == []
@@ -245,7 +260,7 @@ def main():
     assert len(c) == 3, c  # Jane Doe, Dr. John Smith, John Smith (responsible party)
     assert locations.where("nct_id = 'NCT00000001'").count() == 2  # duplicate site removed
 
-    assert {r["nct_id"] for r in gold.collect()} == {"NCT00000001", "NCT00000006"}
+    assert {r["nct_id"] for r in gold.collect()} == {"NCT00000001", "NCT00000006", "NCT00000009"}
     assert set(gold.columns).isdisjoint({"responsible_party_investigator_name", "payload", "raw_json"})
     assert "555-123-4567" not in doc and "trials@example.org" not in doc
     assert "[phone removed]" in doc and "[email removed]" in doc
