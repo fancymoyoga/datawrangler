@@ -4,7 +4,8 @@ Stdlib only, so the same code runs in the Databricks ingest notebook
 (src/01_ingest_api.py) and in the local fallback (scripts/fetch_and_upload.py).
 
 Searches GET /studies with query.cond (e.g. "lung cancer"), follows nextPageToken, and lands
-each study as its own envelope, so bronze/silver see the same shape as a single-study fetch.
+each page (up to 1,000 studies) as one envelope file; silver splits pages into one row per study.
+An optional updated_since date limits the search to studies updated since then (incremental pulls).
 """
 
 import json
@@ -16,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 API_URL = "https://clinicaltrials.gov/api/v2/studies"
 USER_AGENT = "clinical-trials-lakehouse/1.0"
@@ -26,7 +27,8 @@ MAX_RETRIES = 4
 BACKOFF_BASE_SECONDS = 2.0
 MAX_RETRY_AFTER_SECONDS = 120
 TIMEOUT_SECONDS = 60
-PAGE_SIZE = 100
+PAGE_SIZE = 1000  # API maximum; about 12 MB of JSON per page with FIELDS below
+SEARCH_FOLDER = "search"
 
 # Silver and gold only read these, so result/derived/document sections stay out of bronze.
 FIELDS = ("protocolSection", "hasResults")
@@ -37,15 +39,18 @@ SORT = ("@relevance",)
 # alternation, so per CLAUDE.md each item is fullmatched against the grouped form.
 _FIELD_PATTERN = r"[a-zA-Z][a-zA-Z0-9\-. ]*|@query"
 _SORT_PATTERN = r"^(([a-zA-Z][a-zA-Z0-9\-. ]*)|(@relevance))(:(asc|desc))?$"
-_NCT_ID = re.compile(r"^NCT[0-9]{8}$")
 
 
 class ApiUnreachable(Exception):
     """The API could not be reached at the network level (DNS, connect, timeout)."""
 
 
-def search_params(condition):
-    """First-page query parameters, validated locally against the spec before any request."""
+def search_params(condition, updated_since=None):
+    """First-page query parameters, validated locally against the spec before any request.
+
+    updated_since (a date or "YYYY-MM-DD") adds filter.advanced so only studies whose last
+    update was posted on or after that date match. Filters don't change relevance ranking.
+    """
     condition = (condition or "").strip()
     if not condition:
         # With no query and no filter the API returns every study; never do that by accident.
@@ -55,7 +60,11 @@ def search_params(condition):
             raise ValueError(f"Invalid fields item: {field!r}")
     if not 1 <= len(SORT) <= 2 or not all(re.fullmatch(_SORT_PATTERN, s) for s in SORT):
         raise ValueError(f"Invalid sort: {SORT!r}")
-    return {"query.cond": condition, "fields": "|".join(FIELDS), "sort": "|".join(SORT)}
+    params = {"query.cond": condition, "fields": "|".join(FIELDS), "sort": "|".join(SORT)}
+    if updated_since is not None:
+        since = date.fromisoformat(str(updated_since))  # ValueError if it isn't a date
+        params["filter.advanced"] = f"AREA[LastUpdatePostDate]RANGE[{since.isoformat()},MAX]"
+    return params
 
 
 def _is_retryable(status):
@@ -116,8 +125,9 @@ def new_run():
     return str(uuid.uuid4()), datetime.now(timezone.utc)
 
 
-def build_envelope(nct_id, url, status, payload, ingested_at, ingest_id, query=None):
-    """Wrap one study (or an error body). bytes payloads are parsed as JSON, else kept as text."""
+def build_envelope(nct_id, url, status, payload, ingested_at, ingest_id, query=None, page=None):
+    """Wrap one study, one search page or an error body. bytes payloads are parsed as JSON, else
+    kept as text."""
     if isinstance(payload, (bytes, bytearray)):
         try:
             payload = json.loads(payload)
@@ -133,6 +143,8 @@ def build_envelope(nct_id, url, status, payload, ingested_at, ingest_id, query=N
     }
     if query is not None:
         envelope["query"] = query
+    if page is not None:
+        envelope["page"] = page
     return envelope
 
 
@@ -160,73 +172,77 @@ def write_envelope(landing_dir, envelope, ingested_at, folder=None, name=None):
     return path
 
 
-def _study_nct_id(study):
-    ident = (study.get("protocolSection") or {}).get("identificationModule") or {}
-    return ident.get("nctId")
+def land_page(landing_dir, url, status, payload, ingested_at, ingest_id, query, page):
+    """Land one search page (its studies, or the error body) as a single envelope file."""
+    env = build_envelope(None, url, status, payload, ingested_at, ingest_id, query, page=page)
+    return write_envelope(landing_dir, env, ingested_at, folder=SEARCH_FOLDER,
+                          name=f"{ingest_id[:8]}_page{page:04d}")
 
 
-def fetch_search(condition, landing_dir, max_studies, log=print, page_size=PAGE_SIZE):
-    """Search for studies matching `condition`, landing up to `max_studies` of them.
+def fetch_search(condition, landing_dir, max_studies=None, updated_since=None, log=print,
+                 page_size=PAGE_SIZE):
+    """Search for studies matching `condition` and land every page, up to `max_studies` studies.
 
-    Returns (summary, unreachable): summary has total_count, pages and the list of
-    (nct_id, http_status, path) written; unreachable is the ApiUnreachable error if the API
-    dropped off the network (the run stops there). A non-200 page is landed as one error
-    envelope (folder QUERY_ERROR) so silver quarantines it, and pagination stops.
+    Returns (summary, unreachable). summary has ingest_id, ingested_at, total_count, pages,
+    studies, written (a (page, http_status, studies, path) tuple per page) and complete, which
+    is True only if the search ran to its last page. unreachable is the ApiUnreachable error if
+    the API dropped off the network (the run stops there). A non-200 page is landed as one
+    error envelope so silver quarantines it, and pagination stops.
     """
-    if max_studies < 1:
-        raise ValueError("max_studies must be at least 1")
-    params = search_params(condition)
+    if max_studies is not None and max_studies < 1:
+        raise ValueError("max_studies must be at least 1 (or None for every match)")
+    params = search_params(condition, updated_since)
     ingest_id, ingested_at = new_run()
     log(f"ingest_id={ingest_id} ingested_at={ingested_at.isoformat()} "
-        f"query.cond={params['query.cond']!r} max_studies={max_studies}")
+        f"query.cond={params['query.cond']!r} filter.advanced={params.get('filter.advanced')!r} "
+        f"max_studies={max_studies or 'all'}")
 
-    written, seen, pages, total, token = [], set(), 0, None, None
+    summary = {"ingest_id": ingest_id, "ingested_at": ingested_at, "total_count": None,
+               "pages": 0, "studies": 0, "written": [], "complete": False}
+    token = None
     try:
         check_api_version(log=log)
         while True:
             # Later pages resend the first request's parameters exactly; only pageSize,
             # countTotal and pageToken may change.
-            page_params = {**params, "pageSize": min(page_size, max_studies)}
+            remaining = None if max_studies is None else max_studies - summary["studies"]
+            page_params = {**params, "pageSize": page_size if remaining is None else min(page_size, remaining)}
             if token:
                 page_params["pageToken"] = token
             else:
                 page_params["countTotal"] = "true"
             url = f"{API_URL}?{urllib.parse.urlencode(page_params)}"
-            if pages:
+            if summary["pages"]:
                 time.sleep(POLITE_DELAY_SECONDS)
             status, body = get(url, log=log)
-            pages += 1
+            summary["pages"] += 1
+            page = summary["pages"]
 
             if status != 200:
                 # 400/404 bodies are text/plain; log and land them for quarantine.
-                log(f"page {pages}: HTTP {status}: {body[:500].decode('utf-8', errors='replace')}")
-                env = build_envelope(None, url, status, body, ingested_at, ingest_id, params)
-                path = write_envelope(landing_dir, env, ingested_at, folder="QUERY_ERROR", name=f"page{pages}")
-                written.append((None, status, path))
+                log(f"page {page}: HTTP {status}: {body[:500].decode('utf-8', errors='replace')}")
+                path = land_page(landing_dir, url, status, body, ingested_at, ingest_id, params, page)
+                summary["written"].append((page, status, 0, path))
                 break
 
             data = json.loads(body)
-            if total is None:
-                total = data.get("totalCount")
-                log(f"{total} studies match; landing up to {max_studies}")
-            studies = data.get("studies") or []  # an empty page is not the end
-            for i, study in enumerate(studies):
-                if len(seen) >= max_studies:
-                    break
-                nct_id = _study_nct_id(study)
-                if nct_id in seen:
-                    continue
-                safe = nct_id if nct_id and _NCT_ID.match(nct_id) else None
-                env = build_envelope(nct_id, url, 200, study, ingested_at, ingest_id, params)
-                path = write_envelope(landing_dir, env, ingested_at, folder=safe or "NO_NCT_ID",
-                                      name=None if safe else f"page{pages}_{i}")
-                seen.add(nct_id)
-                written.append((nct_id, 200, path))
-            log(f"page {pages}: {len(studies)} studies, {len(seen)} landed so far")
+            if summary["total_count"] is None:
+                summary["total_count"] = data.get("totalCount")
+                log(f"{summary['total_count']} studies match; landing {max_studies or 'all'}")
+            studies = (data.get("studies") or [])[:remaining]  # an empty page is not the end
+            if studies:
+                data["studies"] = studies
+                path = land_page(landing_dir, url, 200, data, ingested_at, ingest_id, params, page)
+                summary["written"].append((page, 200, len(studies), path))
+                summary["studies"] += len(studies)
+            log(f"page {page}: {len(studies)} studies, {summary['studies']} landed so far")
 
             token = data.get("nextPageToken")
-            if not token or len(seen) >= max_studies:
+            if not token:
+                summary["complete"] = True
+                break
+            if max_studies is not None and summary["studies"] >= max_studies:
                 break
     except ApiUnreachable as e:
-        return {"total_count": total, "pages": pages, "written": written}, e
-    return {"total_count": total, "pages": pages, "written": written}, None
+        return summary, e
+    return summary, None

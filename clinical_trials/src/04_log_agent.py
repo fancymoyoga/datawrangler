@@ -11,6 +11,9 @@
 # COMMAND ----------
 
 # MAGIC %pip install -q "mlflow[databricks]>=3.1" "databricks-sdk>=0.50"
+
+# COMMAND ----------
+
 # MAGIC %restart_python
 
 # COMMAND ----------

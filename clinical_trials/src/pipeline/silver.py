@@ -1,4 +1,5 @@
 from pyspark import pipelines as dp
+from pyspark.sql.functions import struct
 
 import transforms
 
@@ -28,17 +29,18 @@ def silver_studies_quarantine():
     return transforms.quarantine(spark.readStream.table("silver_studies_parsed"))
 
 
-@dp.temporary_view(name="silver_studies_latest")
-def silver_studies_latest():
-    return transforms.latest_versions(spark.read.table("silver_studies_validated"))
-
-
-@dp.materialized_view(
+# SCD Type 1: each new validated version upserts its study, so runs only process new rows.
+dp.create_streaming_table(
     name="silver_studies",
-    comment="Current version of each study (newest last update, then newest pull)",
+    comment="Current version of each study (Auto CDC SCD Type 1: newest last update, then newest pull)",
 )
-def silver_studies():
-    return transforms.current_studies(spark.read.table("silver_studies_latest"))
+dp.create_auto_cdc_flow(
+    target="silver_studies",
+    source="silver_studies_validated",
+    keys=transforms.CDC_KEYS,
+    sequence_by=struct(*transforms.CDC_SEQUENCE),
+    stored_as_scd_type=1,
+)
 
 
 @dp.materialized_view(
@@ -46,7 +48,7 @@ def silver_studies():
     comment="PII: one row per person per study (central contacts, officials, site contacts, responsible party)",
 )
 def silver_study_contacts():
-    return transforms.contacts(spark.read.table("silver_studies_latest"))
+    return transforms.contacts(spark.read.table("silver_studies"))
 
 
 @dp.materialized_view(
@@ -55,4 +57,4 @@ def silver_study_contacts():
 )
 @dp.expect_all(transforms.LOCATION_RULES)
 def silver_study_locations():
-    return transforms.locations(spark.read.table("silver_studies_latest"))
+    return transforms.locations(spark.read.table("silver_studies"))

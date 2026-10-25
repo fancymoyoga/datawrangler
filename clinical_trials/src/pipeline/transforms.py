@@ -109,24 +109,36 @@ OUTCOMES_TYPE = "array<struct<measure:string,timeFrame:string>>"
 def parse_studies(bronze: DataFrame) -> DataFrame:
     """Parse bronze envelopes into typed study columns plus failed_rules / dq_warnings.
 
-    Every field is read with try_parse_json / try_variant_get, so schema drift yields
-    NULLs (and rule failures) rather than errors. Used by both validated and quarantine.
+    A search-page envelope (payload.studies) becomes one row per study; any other envelope (a
+    single study, an error body, unparseable JSON) is one row. Every field is read with
+    try_parse_json / try_variant_get, so schema drift yields NULLs (and rule failures) rather
+    than errors. Used by both validated and quarantine.
     """
     env = bronze.withColumn("_env", F.try_parse_json("raw_json"))
+    page_studies = F.try_variant_get("_env", "$.payload.studies", "array<variant>")
+    # Only small columns go through the explode: a 1,000-study page is ~12 MB, and carrying
+    # raw_json or _env would copy it onto every study row.
     meta = env.select(
-        "*",
         F.col("_env").isNotNull().alias("is_valid_json"),
-        # Fall back to the landing folder name ({NCT_ID}/...) when the file isn't valid JSON.
+        # Single-study envelopes name the study they asked for; fall back to the landing folder
+        # ({NCT_ID}/...) when the file isn't valid JSON.
         F.coalesce(
             F.try_variant_get("_env", "$.requested_nct_id", "string"),
-            F.nullif(F.regexp_extract("source_file", r"([^/\\]+)[/\\][^/\\]+$", 1), F.lit("")),
-        ).alias("requested_nct_id"),
+            F.nullif(F.regexp_extract("source_file", r"(NCT[0-9]{8})[/\\][^/\\]+$", 1), F.lit("")),
+        ).alias("_envelope_nct_id"),
         F.try_variant_get("_env", "$.source_url", "string").alias("source_url"),
         F.try_variant_get("_env", "$.http_status", "int").alias("http_status"),
         F.try_variant_get("_env", "$.ingested_at", "string").try_cast("timestamp").alias("ingested_at"),
         F.try_variant_get("_env", "$.ingest_id", "string").alias("ingest_id"),
-        F.try_variant_get("_env", "$.payload", "variant").alias("payload"),
-    ).drop("_env")
+        "source_file",
+        "file_sha256",
+        "file_modified_at",
+        "bronze_loaded_at",
+        F.substring("raw_json", 1, 2000).alias("raw_json_snippet"),
+        # An empty page yields no rows; it isn't an error.
+        F.explode(F.coalesce(
+            page_studies, F.array(F.try_variant_get("_env", "$.payload", "variant")))).alias("payload"),
+    )
 
     interventions = _get(f"{PROTO}.armsInterventionsModule.interventions", INTERVENTIONS_TYPE)
     primary_outcomes = _get(f"{PROTO}.outcomesModule.primaryOutcomes", OUTCOMES_TYPE)
@@ -137,7 +149,9 @@ def parse_studies(bronze: DataFrame) -> DataFrame:
 
     parsed = meta.select(
         _get(f"{PROTO}.identificationModule.nctId", "string").alias("nct_id"),
-        "requested_nct_id",
+        # A search page asks for no particular study, so each study answers for itself.
+        F.coalesce("_envelope_nct_id", _get(f"{PROTO}.identificationModule.nctId", "string"))
+        .alias("requested_nct_id"),
         "http_status",
         "is_valid_json",
         _get(f"{PROTO}.identificationModule.briefTitle", "string").alias("brief_title"),
@@ -185,7 +199,7 @@ def parse_studies(bronze: DataFrame) -> DataFrame:
         "file_sha256",
         "file_modified_at",
         "bronze_loaded_at",
-        "raw_json",
+        "raw_json_snippet",
         "payload",
     )
     return parsed.withColumns({
@@ -196,7 +210,7 @@ def parse_studies(bronze: DataFrame) -> DataFrame:
 
 def validated(parsed: DataFrame) -> DataFrame:
     """Columns of silver_studies_validated (the critical-rule drop is applied by expectations)."""
-    return parsed.drop("failed_rules", "raw_json")
+    return parsed.drop("failed_rules", "raw_json_snippet")
 
 
 def quarantine(parsed: DataFrame) -> DataFrame:
@@ -214,7 +228,7 @@ def quarantine(parsed: DataFrame) -> DataFrame:
         "source_file",
         "file_sha256",
         "bronze_loaded_at",
-        F.substring("raw_json", 1, 2000).alias("raw_json_snippet"),
+        "raw_json_snippet",
         F.current_timestamp().alias("quarantined_at"),
     )
 
@@ -229,25 +243,17 @@ def apply_critical_rules(parsed: DataFrame) -> DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def latest_versions(validated_df: DataFrame) -> DataFrame:
-    """One row per nct_id: newest last_update_posted_date, then newest ingested_at."""
-    by_study = Window.partitionBy("nct_id")
-    newest_first = by_study.orderBy(
-        F.col("last_update_posted_date").desc_nulls_last(), F.col("ingested_at").desc_nulls_last()
-    )
-    return (
-        validated_df.withColumns({
-            "_rank": F.row_number().over(newest_first),
-            "times_pulled": F.count(F.lit(1)).over(by_study),
-            "distinct_versions": F.size(F.collect_set("payload_hash").over(by_study)),
-        })
-        .where("_rank = 1")
-        .drop("_rank")
-    )
+# silver_studies is an Auto CDC (SCD Type 1) target fed by silver_studies_validated: one row per
+# nct_id, the newest last_update_posted_date winning, then the newest ingested_at.
+CDC_KEYS = ["nct_id"]
+CDC_SEQUENCE = ["last_update_posted_date", "ingested_at"]
 
 
-def current_studies(latest: DataFrame) -> DataFrame:
-    return latest.drop("payload")
+def apply_scd1(changes: DataFrame) -> DataFrame:
+    """What the SCD Type 1 Auto CDC flow keeps (newest row per key); used by local tests."""
+    newest_first = Window.partitionBy(*CDC_KEYS).orderBy(
+        *[F.col(c).desc_nulls_last() for c in CDC_SEQUENCE])
+    return changes.withColumn("_rank", F.row_number().over(newest_first)).where("_rank = 1").drop("_rank")
 
 
 PERSON_TYPE = "array<struct<name:string,role:string,phone:string,phoneExt:string,email:string,affiliation:string>>"

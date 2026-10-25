@@ -39,7 +39,7 @@ SOURCE_TABLE = f"{CATALOG}.{SCHEMA}.gold_study_documents_vs_source"
 INDEX_NAME = f"{CATALOG}.{SCHEMA}.gold_study_documents_index"
 COLUMNS_TO_SYNC = ["nct_id", "brief_title", "overall_status", "study_type", "lead_sponsor_name",
                    "document_text"]
-TIMEOUT_SECONDS = 40 * 60
+TIMEOUT_SECONDS = 2 * 60 * 60
 
 w = WorkspaceClient()
 
