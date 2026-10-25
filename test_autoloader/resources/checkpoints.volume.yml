@@ -1,0 +1,8 @@
+resources:
+  volumes:
+    checkpoints:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.autoloader.name}
+      name: checkpoints
+      volume_type: MANAGED
+      comment: Auto Loader checkpoints and inferred schemas, one folder per stream

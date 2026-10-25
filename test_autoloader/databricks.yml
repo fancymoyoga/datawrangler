@@ -1,0 +1,30 @@
+# Declarative Automation Bundle for test_autoloader: an Auto Loader job that loads the
+# clinical_trials landing JSON files into Delta tables.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
+bundle:
+  name: test_autoloader
+
+include:
+  - resources/*.yml
+
+sync:
+  exclude:
+    - "**/__pycache__/**"
+
+variables:
+  catalog:
+    description: Catalog for the Auto Loader tables (must already exist).
+    default: clinicaltrials
+  source_path:
+    description: Folder Auto Loader reads (the clinical_trials landing volume).
+    default: /Volumes/workspace/dev_monica_enders_clinical_trials/landing/studies
+
+targets:
+  dev:
+    # No `mode: development`: it would rename the schema to dev_<user>_autoloader, and the
+    # tables belong in clinicaltrials.autoloader.
+    default: true
+    workspace:
+      host: https://dbc-2831e5fc-ccb1.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
