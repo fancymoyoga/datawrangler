@@ -11,9 +11,9 @@ Each discharged patient receives a 30-day readmission risk score between 0 and 1
 
 | Tier | Score | Outreach standard |
 |---|---|---|
-| High | 0.40 and above | Call within 24–48 hours; visit within 7 days; condition-specific protocol applies in full |
-| Medium | 0.20 to 0.39 | Call within 72 hours; visit within 14 days |
-| Low | Below 0.20 | Standard discharge instructions; automated text check-in at day 3 |
+| High | 0.30 and above | Call within 24–48 hours; visit within 7 days; condition-specific protocol applies in full |
+| Medium | 0.15 to 0.29 | Call within 72 hours; visit within 14 days |
+| Low | Below 0.15 | Standard discharge instructions; automated text check-in at day 3 |
 
 ## Steps
 1. **Review the daily high-risk list** each morning. Patients are sorted by risk score, highest first.
