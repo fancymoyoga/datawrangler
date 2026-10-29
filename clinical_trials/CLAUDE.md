@@ -372,7 +372,8 @@ Note: as written, the `/studies` `fields` pattern doesn't group its alternation:
 Ingest clinical trial records from the ClinicalTrials.gov v2 API into a medallion lakehouse on
 Databricks. The gold table feeds an AI model.
 
-- Source: `GET /studies?query.cond=<condition>` (default `lung cancer`), paged, capped at
+- Source: `GET /studies?query.cond=<condition>&query.term=<search>` (condition default
+  `lung cancer`, search default blank; at least one required), paged, capped at
   `max_studies` per run (default 100)
 - Layers: bronze (raw) → silver (validated, deduplicated, PII-tagged) → gold (PII-free, AI-ready)
 
@@ -381,7 +382,10 @@ Databricks. The gold table feeds an AI model.
 - **Databricks Free Edition**: serverless compute only. Never add cluster configs
   (`new_cluster`, `job_clusters`, `clusters`, instance pools, `node_type_id`).
   Pipelines use `serverless: true`; job tasks use serverless environments.
-- **Catalog**: `workspace`.
+- **Catalogs**: `workspace` (`var.catalog`) holds the landing volume, `ingest_runs`, gold, the
+  vector index and the agent. Bronze and silver publish to `clinicaltrials` (`var.bronze_silver_catalog`),
+  schema `${resources.schemas.clinical_trials_bronze_silver.name}`, via fully qualified dataset names
+  built from the pipeline setting `bronze_silver_schema`.
 - **Packaging**: everything is a Databricks Asset Bundle (`databricks.yml` + `resources/`).
   The `dev` target uses `mode: development`. `databricks.yml` must keep
   `include: resources/*.yml`: without it a deploy deletes every resource defined there.
@@ -399,7 +403,7 @@ Databricks. The gold table feeds an AI model.
 ## As built
 
 - **Landing** (`src/ctgov_client.py`, run by `src/01_ingest_api.py`): searches `/studies` with
-  `query.cond`, `fields=protocolSection|hasResults`, `sort=@relevance`, `pageSize=1000`, follows
+  `query.cond` (job param `condition`) and/or `query.term` (job param `search`), `fields=protocolSection|hasResults`, `sort=@relevance`, `pageSize=1000`, follows
   `nextPageToken` with the first page's parameters unchanged, and checks `/version` each run.
   Each page lands as one envelope (about 12 MB for 1,000 studies) at
   `<volume>/studies/search/{yyyyMMddTHHmmssZ}_{ingest_id[:8]}_page{nnnn}.json`:
@@ -409,8 +413,8 @@ Databricks. The gold table feeds an AI model.
   Loader never sees partial files. Retries 429/5xx with backoff; if the API is unreachable,
   `scripts/fetch_and_upload.py` does the same search locally and uploads with `databricks fs cp`.
   Older single-study envelopes (`{NCT_ID}/...json`, with `requested_nct_id`) still parse.
-- **Incremental pulls**: `01_ingest_api.py` records every run in `ingest_runs` (`complete` = the
-  search reached its last page with no error or cap). With `incremental=true`, a condition that has
+- **Incremental pulls**: `01_ingest_api.py` records every run in `ingest_runs` (keyed on `condition` + `search_term`; `complete` = the
+  search reached its last page with no error or cap). With `incremental=true`, a condition + search pair that has
   a complete run is searched with `filter.advanced=AREA[LastUpdatePostDate]RANGE[<that run's UTC
   date - 1 day>,MAX]`; the day of overlap covers US-dated updates posted after the run. Blank
   `max_studies` lands every match; a capped run is never complete. `incremental=false` re-fetches all.
@@ -420,11 +424,15 @@ Databricks. The gold table feeds an AI model.
   `expect_all`), `silver_studies_quarantine` (same parse, `failed_rules` array),
   `silver_studies` (Auto CDC SCD Type 1 streaming table from validated, keyed on `nct_id`,
   sequenced by `struct(last_update_posted_date, ingested_at)`; keeps `payload` for the child
-  tables), `silver_study_contacts` (PII), `silver_study_locations`. Rules live in
+  tables), `silver_study_contacts` (PII), `silver_study_locations`,
+  `silver_study_eligibility_criteria` (one row per inclusion/exclusion criterion split out of the
+  eligibility markdown; text with no section headers is `unspecified`), `silver_study_outcomes`
+  (one row per primary/secondary/other planned outcome measure). Rules live in
   `src/pipeline/transforms.py`; NULL rule results count as failures.
   Known gap: the `known_overall_status` rule hard-codes the status list instead of loading
   `/studies/enums` (development rule 9).
-- **PII tagging** (`src/02_tag_pii.py`): UC column tags `pii` / `pii_type` / `pii_detection`,
+- **PII tagging** (`src/02_tag_pii.py`, run once per schema: tasks `tag_pii` for gold and
+  `tag_pii_bronze_silver`, which passes `pii_catalog`/`pii_schema`): UC column tags `pii` / `pii_type` / `pii_detection`,
   table tag `contains_pii`, audit in `pii_tag_audit`. Removes tags a run no longer confirms and
   skips pipeline-internal `__materialization_*` tables. Fails the run on direct identifiers in gold.
 - **Gold** `gold_study_documents`: allow-listed columns only; free text and `document_text`
@@ -443,7 +451,8 @@ Databricks. The gold table feeds an AI model.
 clinical_trials/
 ├── databricks.yml                     # bundle, variables, sync excludes, dev target
 ├── resources/
-│   ├── clinical_trials.schema.yml     # schema clinical_trials
+│   ├── clinical_trials.schema.yml     # schema clinical_trials (workspace: gold)
+│   ├── clinical_trials_bronze_silver.schema.yml  # schema clinical_trials (clinicaltrials: bronze, silver)
 │   ├── landing.volume.yml             # managed volume landing
 │   ├── clinical_trials.pipeline.yml   # SDP pipeline (serverless, triggered)
 │   ├── clinical_trials.job.yml        # ingest → pipeline → tag PII → sync vector index

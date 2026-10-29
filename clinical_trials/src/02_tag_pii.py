@@ -2,7 +2,8 @@
 # MAGIC %md
 # MAGIC # Tag PII with Unity Catalog column tags
 # MAGIC
-# MAGIC Scans every table in the schema and sets column tags `pii` (`true` / `quasi` / `embedded`),
+# MAGIC Scans every table in one schema (`pii_catalog`.`pii_schema` if set, else `catalog`.`schema`;
+# MAGIC the job runs it for the gold schema and for the bronze/silver schema) and sets column tags `pii` (`true` / `quasi` / `embedded`),
 # MAGIC `pii_type` and `pii_detection`, plus a table tag `contains_pii`. Every decision is appended
 # MAGIC to `pii_tag_audit`.
 # MAGIC
@@ -26,10 +27,12 @@ from pipeline.transforms import EMAIL_PATTERN, PHONE_PATTERN
 
 dbutils.widgets.text("catalog", "workspace")
 dbutils.widgets.text("schema", "clinical_trials")
+dbutils.widgets.text("pii_catalog", "")
+dbutils.widgets.text("pii_schema", "")
 dbutils.widgets.dropdown("use_ai_pii_check", "true", ["true", "false"])
 
-CATALOG = dbutils.widgets.get("catalog")
-SCHEMA = dbutils.widgets.get("schema")
+CATALOG = dbutils.widgets.get("pii_catalog").strip() or dbutils.widgets.get("catalog")
+SCHEMA = dbutils.widgets.get("pii_schema").strip() or dbutils.widgets.get("schema")
 USE_AI = dbutils.widgets.get("use_ai_pii_check") == "true"
 
 AUDIT_TABLE = "pii_tag_audit"

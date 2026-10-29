@@ -4,6 +4,8 @@ Plain functions (DataFrame in, DataFrame out) so they can be unit-tested with lo
 PySpark. bronze.py / silver.py / gold.py wrap them in Spark Declarative Pipeline datasets.
 """
 
+from functools import reduce
+
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 
@@ -368,6 +370,96 @@ def locations(latest: DataFrame) -> DataFrame:
         sites.withColumn("location_id", F.sha2(key, 256))
         .dropDuplicates(["location_id"])
         .select("location_id", *sites.columns)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Silver: eligibility criteria and outcomes
+# ---------------------------------------------------------------------------
+
+# A section header line in eligibilityCriteria: "Inclusion Criteria:", "**Key Exclusion Criteria**",
+# "EXCLUSION CRITERIA (Cohort 2):". Group 1 is the section, group 2 any text after the colon.
+CRITERIA_HEADER = (
+    r"(?i)^[\s*#_>-]*(?:key\s+|main\s+|major\s+|general\s+)?(inclusion|exclusion)\s+criteri(?:a|on)"
+    r"(?:\s*\([^)]*\)|\s+for\s+[^:]{1,60})?[\s*_]*(?::|$)[\s*_]*(.*)$"
+)
+# A list item: "* text", "- text", "1. text", "a) text". Group 1 is the indent, group 2 the text.
+CRITERIA_BULLET = r"^(\s*)(?:[*•+-]|\d{1,3}[.)]|[a-zA-Z][.)])\s+(.*)$"
+
+
+def eligibility_criteria(latest: DataFrame) -> DataFrame:
+    """One row per inclusion / exclusion criterion, split out of the eligibilityCriteria text.
+
+    Each top-level list item is one criterion; its sub-items and wrapped lines are joined onto it.
+    A section without list items gives one criterion per non-blank line. Text before the first
+    section header has criterion_type 'unspecified'.
+    """
+    by_line = Window.partitionBy("nct_id").orderBy("line_no")
+    # ClinicalTrials.gov markdown escapes punctuation ("\>= 18 years"); unescape it first.
+    text = F.regexp_replace("eligibility_criteria", r"\\([^\w\s])", "$1")
+    lines = (
+        latest.select("nct_id", F.posexplode(F.split(text, r"\r?\n")).alias("line_no", "line"))
+        .withColumn("_header", F.lower(F.regexp_extract("line", CRITERIA_HEADER, 1)))
+        .withColumn("_content", F.when(F.col("_header") != "",
+                                       F.regexp_extract("line", CRITERIA_HEADER, 2)).otherwise(F.col("line")))
+        .withColumn("criterion_type", F.coalesce(
+            F.last(F.when(F.col("_header") != "", F.col("_header")), ignorenulls=True).over(
+                by_line.rowsBetween(Window.unboundedPreceding, Window.currentRow)),
+            F.lit("unspecified")))
+        .withColumn("_is_bullet", F.col("_content").rlike(CRITERIA_BULLET))
+        .withColumn("_indent", F.when(
+            F.col("_is_bullet"), F.length(F.regexp_extract("_content", CRITERIA_BULLET, 1))))
+        .withColumn("_text", F.trim(F.when(F.col("_is_bullet"), F.regexp_extract("_content", CRITERIA_BULLET, 2))
+                                    .otherwise(F.col("_content"))))
+        .where(F.col("_text") != "")
+    )
+    section = Window.partitionBy("nct_id", "criterion_type")
+    # A top-level item starts at the least-indented list marker; with no markers, every line does.
+    starts = F.when(F.col("_top_indent").isNull(), True).otherwise(
+        F.coalesce(F.col("_indent") <= F.col("_top_indent"), F.lit(False)))
+    items = (
+        lines.withColumn("_top_indent", F.min("_indent").over(section))
+        .withColumn("_start", starts.cast("int"))
+        .withColumn("_item", F.sum("_start").over(
+            section.orderBy("line_no").rowsBetween(Window.unboundedPreceding, Window.currentRow)))
+        .groupBy("nct_id", "criterion_type", "_item")
+        .agg(F.min("line_no").alias("_first_line"),
+             F.array_sort(F.collect_list(F.struct("line_no", "_text"))).alias("_lines"))
+        .select("nct_id", "criterion_type", "_first_line",
+                F.regexp_replace(F.array_join(F.transform("_lines", lambda x: x["_text"]), " "),
+                                 r"\s+", " ").alias("criterion_text"))
+        .withColumn("criterion_number", F.row_number().over(
+            Window.partitionBy("nct_id", "criterion_type").orderBy("_first_line")))
+    )
+    return items.select(
+        F.sha2(F.concat_ws("|", "nct_id", "criterion_type", "criterion_number"), 256).alias("criterion_id"),
+        "nct_id", "criterion_type", "criterion_number", "criterion_text",
+    )
+
+
+OUTCOME_DETAIL_TYPE = "array<struct<measure:string,description:string,timeFrame:string>>"
+OUTCOME_KINDS = (("primary", "primaryOutcomes"), ("secondary", "secondaryOutcomes"), ("other", "otherOutcomes"))
+
+
+def outcomes(latest: DataFrame) -> DataFrame:
+    """One row per planned outcome measure (primary, secondary, other pre-specified)."""
+    parts = [
+        latest.select("nct_id", F.posexplode(_get(f"{PROTO}.outcomesModule.{field}", OUTCOME_DETAIL_TYPE))
+                      .alias("pos", "o"))
+        .select(
+            "nct_id",
+            F.lit(kind).alias("outcome_type"),
+            (F.col("pos") + 1).alias("outcome_number"),
+            _blank_to_null(F.col("o.measure")).alias("measure"),
+            _blank_to_null(F.col("o.description")).alias("description"),
+            _blank_to_null(F.col("o.timeFrame")).alias("time_frame"),
+        )
+        for kind, field in OUTCOME_KINDS
+    ]
+    all_outcomes = reduce(DataFrame.unionByName, parts).where(F.col("measure").isNotNull())
+    return all_outcomes.select(
+        F.sha2(F.concat_ws("|", "nct_id", "outcome_type", "outcome_number"), 256).alias("outcome_id"),
+        *all_outcomes.columns,
     )
 
 

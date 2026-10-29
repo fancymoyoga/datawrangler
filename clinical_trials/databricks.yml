@@ -19,6 +19,9 @@ variables:
   catalog:
     description: Unity Catalog catalog for all clinical trials data
     default: workspace
+  bronze_silver_catalog:
+    description: Catalog for the bronze and silver tables (must already exist)
+    default: clinicaltrials
   # study_contacts job (FHIR loader)
   fhir_nct_ids:
     description: Comma-separated NCT IDs for the study_contacts job to load.

@@ -26,6 +26,11 @@ import transforms as t  # noqa: E402
 from ctgov_client import build_envelope, land_page, write_envelope  # noqa: E402
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+# Markdown as the API returns it: escaped ">", nested list items, numbered items, a wrapped line.
+RICH_CRITERIA = ("Inclusion Criteria:\n\n* Age \\>= 18 years\n* Measurable disease, defined as:\n\n"
+                 "  * at least one lesion\n  * per RECIST 1.1\n* ECOG 0-1\n\n"
+                 "**Exclusion Criteria:**\n\n1. Prior ibrutinib\n2. Active infection requiring\n"
+                 "   systemic therapy")
 
 
 def study(nct_id, title="Ibrutinib in Waldenstrom Macroglobulinemia", status="RECRUITING",
@@ -150,7 +155,8 @@ def build_landing(root):
     at = T0 + timedelta(minutes=30)
     url = "https://clinicaltrials.gov/api/v2/studies?query.cond=test"
     query = {"query.cond": "test"}
-    land_page(root, url, 200, {"studies": [study("NCT00000009"), copy.deepcopy(v2)],
+    land_page(root, url, 200, {"studies": [study("NCT00000009", **{
+        "protocolSection.eligibilityModule.eligibilityCriteria": RICH_CRITERIA}), copy.deepcopy(v2)],
                                "nextPageToken": "abc"}, at, "run-30-search", query, 1)
     land_page(root, url, 200, {"studies": [], "nextPageToken": "def"}, at, "run-30-search", query, 2)
     land_page(root, url, 400, b"pageToken is invalid", at, "run-30-search", query, 3)
@@ -204,6 +210,8 @@ def main():
     studies = t.apply_scd1(validated).cache()
     contacts = t.contacts(studies)
     locations = t.locations(studies)
+    criteria = t.eligibility_criteria(studies).cache()
+    outcomes = t.outcomes(studies).cache()
     gold_all = t.documents(studies).cache()
     gold = gold_all.where(" AND ".join(t.GOLD_RULES.values()))
 
@@ -223,6 +231,10 @@ def main():
          "nct_id", "name", "email", "phone", "phone_ext", "sources", truncate=False)
     show("silver_study_locations", locations, "nct_id", "facility", "city", "zip", "country", "lat", "lon",
          F.expr(t.LOCATION_RULES["valid_coordinates"]).alias("valid_coordinates"), truncate=False)
+    show("silver_study_eligibility_criteria", criteria, "nct_id", "criterion_type", "criterion_number",
+         "criterion_text", truncate=False)
+    show("silver_study_outcomes", outcomes, "nct_id", "outcome_type", "outcome_number", "measure",
+         "time_frame", truncate=False)
     show("gold_study_documents (before min-length rule)", gold_all, "nct_id", "document_chars")
     show("gold_study_documents", gold, "nct_id", "document_chars")
     doc = gold.where("nct_id = 'NCT00000001'").first()["document_text"]
@@ -259,6 +271,24 @@ def main():
     assert jane[0]["sources"] == ["central_contact", "location_contact"]
     assert len(c) == 3, c  # Jane Doe, Dr. John Smith, John Smith (responsible party)
     assert locations.where("nct_id = 'NCT00000001'").count() == 2  # duplicate site removed
+
+    def criteria_of(nct_id, kind):
+        rows = criteria.where(f"nct_id = '{nct_id}' AND criterion_type = '{kind}'").orderBy("criterion_number")
+        return [r["criterion_text"] for r in rows.collect()]
+
+    assert criteria_of("NCT00000009", "inclusion") == [
+        "Age >= 18 years", "Measurable disease, defined as: at least one lesion per RECIST 1.1", "ECOG 0-1"]
+    assert criteria_of("NCT00000009", "exclusion") == [
+        "Prior ibrutinib", "Active infection requiring systemic therapy"]
+    assert criteria_of("NCT00000001", "inclusion") == [
+        "Age >= 18 years", "Questions: call 555-123-4567 or email trials@example.org"]
+    assert criteria.where("nct_id = 'NCT00000007'").count() == 0  # no eligibility text
+
+    o = {(r["outcome_type"], r["outcome_number"]): r for r in outcomes.where("nct_id = 'NCT00000001'").collect()}
+    assert set(o) == {("primary", 1), ("secondary", 1)}, o
+    assert o[("primary", 1)]["measure"] == "Overall response rate"
+    assert o[("primary", 1)]["time_frame"] == "Up to 2 years" and o[("secondary", 1)]["time_frame"] is None
+    assert outcomes.select("outcome_id").distinct().count() == outcomes.count()
 
     assert {r["nct_id"] for r in gold.collect()} == {"NCT00000001", "NCT00000006", "NCT00000009"}
     assert set(gold.columns).isdisjoint({"responsible_party_investigator_name", "payload", "raw_json"})

@@ -17,4 +17,6 @@ resources:
             path: ../src/pipeline/gold.py
       configuration:
         # Keep in sync with the job's landing_path parameter.
+        # Bronze and silver tables publish here; gold uses the pipeline's catalog and schema.
+        bronze_silver_schema: ${var.bronze_silver_catalog}.${resources.schemas.clinical_trials_bronze_silver.name}
         landing_path: /Volumes/${var.catalog}/${resources.schemas.clinical_trials.name}/${resources.volumes.landing.name}/studies

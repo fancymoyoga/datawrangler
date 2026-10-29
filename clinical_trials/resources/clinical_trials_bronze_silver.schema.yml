@@ -1,0 +1,6 @@
+resources:
+  schemas:
+    clinical_trials_bronze_silver:
+      catalog_name: ${var.bronze_silver_catalog}
+      name: clinical_trials
+      comment: ClinicalTrials.gov studies - bronze and silver layers (gold stays in the clinical_trials schema of var.catalog)

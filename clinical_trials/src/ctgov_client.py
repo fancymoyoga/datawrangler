@@ -3,7 +3,8 @@
 Stdlib only, so the same code runs in the Databricks ingest notebook
 (src/01_ingest_api.py) and in the local fallback (scripts/fetch_and_upload.py).
 
-Searches GET /studies with query.cond (e.g. "lung cancer"), follows nextPageToken, and lands
+Searches GET /studies with query.cond (a condition, e.g. "lung cancer") and/or query.term (a
+free-text search string, e.g. "pembrolizumab AND AREA[Phase]PHASE3"), follows nextPageToken, and lands
 each page (up to 1,000 studies) as one envelope file; silver splits pages into one row per study.
 An optional updated_since date limits the search to studies updated since then (incremental pulls).
 """
@@ -45,22 +46,30 @@ class ApiUnreachable(Exception):
     """The API could not be reached at the network level (DNS, connect, timeout)."""
 
 
-def search_params(condition, updated_since=None):
+def search_params(condition=None, updated_since=None, search=None):
     """First-page query parameters, validated locally against the spec before any request.
 
+    condition goes to query.cond and search to query.term (both Essie syntax); at least one
+    is required, and when both are given a study must match both.
     updated_since (a date or "YYYY-MM-DD") adds filter.advanced so only studies whose last
     update was posted on or after that date match. Filters don't change relevance ranking.
     """
     condition = (condition or "").strip()
-    if not condition:
+    search = (search or "").strip()
+    if not condition and not search:
         # With no query and no filter the API returns every study; never do that by accident.
-        raise ValueError("A search condition is required (e.g. 'lung cancer')")
+        raise ValueError("A search condition or search string is required (e.g. 'lung cancer')")
     for field in FIELDS:
         if not re.fullmatch(_FIELD_PATTERN, field):
             raise ValueError(f"Invalid fields item: {field!r}")
     if not 1 <= len(SORT) <= 2 or not all(re.fullmatch(_SORT_PATTERN, s) for s in SORT):
         raise ValueError(f"Invalid sort: {SORT!r}")
-    params = {"query.cond": condition, "fields": "|".join(FIELDS), "sort": "|".join(SORT)}
+    params = {}
+    if condition:
+        params["query.cond"] = condition
+    if search:
+        params["query.term"] = search
+    params.update({"fields": "|".join(FIELDS), "sort": "|".join(SORT)})
     if updated_since is not None:
         since = date.fromisoformat(str(updated_since))  # ValueError if it isn't a date
         params["filter.advanced"] = f"AREA[LastUpdatePostDate]RANGE[{since.isoformat()},MAX]"
@@ -180,8 +189,9 @@ def land_page(landing_dir, url, status, payload, ingested_at, ingest_id, query, 
 
 
 def fetch_search(condition, landing_dir, max_studies=None, updated_since=None, log=print,
-                 page_size=PAGE_SIZE):
-    """Search for studies matching `condition` and land every page, up to `max_studies` studies.
+                 page_size=PAGE_SIZE, search=None):
+    """Search for studies matching `condition` (query.cond) and/or `search` (query.term) and land
+    every page, up to `max_studies` studies.
 
     Returns (summary, unreachable). summary has ingest_id, ingested_at, total_count, pages,
     studies, written (a (page, http_status, studies, path) tuple per page) and complete, which
@@ -191,10 +201,11 @@ def fetch_search(condition, landing_dir, max_studies=None, updated_since=None, l
     """
     if max_studies is not None and max_studies < 1:
         raise ValueError("max_studies must be at least 1 (or None for every match)")
-    params = search_params(condition, updated_since)
+    params = search_params(condition, updated_since, search)
     ingest_id, ingested_at = new_run()
     log(f"ingest_id={ingest_id} ingested_at={ingested_at.isoformat()} "
-        f"query.cond={params['query.cond']!r} filter.advanced={params.get('filter.advanced')!r} "
+        f"query.cond={params.get('query.cond')!r} query.term={params.get('query.term')!r} "
+        f"filter.advanced={params.get('filter.advanced')!r} "
         f"max_studies={max_studies or 'all'}")
 
     summary = {"ingest_id": ingest_id, "ingested_at": ingested_at, "total_count": None,
