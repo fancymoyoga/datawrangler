@@ -156,7 +156,11 @@ def build_landing(root):
     url = "https://clinicaltrials.gov/api/v2/studies?query.cond=test"
     query = {"query.cond": "test"}
     land_page(root, url, 200, {"studies": [study("NCT00000009", **{
-        "protocolSection.eligibilityModule.eligibilityCriteria": RICH_CRITERIA}), copy.deepcopy(v2)],
+        "protocolSection.eligibilityModule.eligibilityCriteria": RICH_CRITERIA,
+        # a case-insensitive repeat and a blank are dropped
+        "protocolSection.conditionsModule.conditions": [
+            "Waldenstrom Macroglobulinemia", " ", "Lymphoma", "waldenstrom  macroglobulinemia"]}),
+        copy.deepcopy(v2)],
                                "nextPageToken": "abc"}, at, "run-30-search", query, 1)
     land_page(root, url, 200, {"studies": [], "nextPageToken": "def"}, at, "run-30-search", query, 2)
     land_page(root, url, 400, b"pageToken is invalid", at, "run-30-search", query, 3)
@@ -212,6 +216,7 @@ def main():
     locations = t.locations(studies)
     criteria = t.eligibility_criteria(studies).cache()
     outcomes = t.outcomes(studies).cache()
+    conditions = t.conditions(studies).cache()
     gold_all = t.documents(studies).cache()
     gold = gold_all.where(" AND ".join(t.GOLD_RULES.values()))
 
@@ -289,6 +294,51 @@ def main():
     assert o[("primary", 1)]["measure"] == "Overall response rate"
     assert o[("primary", 1)]["time_frame"] == "Up to 2 years" and o[("secondary", 1)]["time_frame"] is None
     assert outcomes.select("outcome_id").distinct().count() == outcomes.count()
+
+    cond = {r["nct_id"]: [] for r in studies.collect()}
+    for r in conditions.orderBy("nct_id", "condition_number").collect():
+        cond[r["nct_id"]].append(r["condition"])
+    assert cond["NCT00000001"] == ["Waldenstrom Macroglobulinemia"]
+    assert cond["NCT00000009"] == ["Waldenstrom Macroglobulinemia", "Lymphoma"], cond
+    assert cond["NCT00000007"] == []  # no conditions listed
+
+    cohort_cases = {
+        "Leukemia, Lymphocytic, Chronic, B-Cell": ["CLL"], "B-CLL": ["CLL"], "CLL/SLL": ["CLL", "SLL"],
+        "Chronic Lymphoid Leukaemia": ["CLL"], "Lymphoma, Small Lymphocytic": ["SLL"],
+        "Richter Syndrome": ["Richter transformation"], "Waldenström's Macroglobulinaemia (WM)": ["WM"],
+        "Lymphoplasmacytic Lymphoma": ["LPL"], "Other B-cell NHL Subtypes, Including WM": ["WM"],
+        "T-Cell Chronic Lymphocytic Leukemia": [], "Prolymphocytic Leukemia": [],
+        "Acute Lymphocytic Leukemia": [], "Waldenström; Hypergammaglobulinemia": [],
+    }
+    rows = literal_df(spark, [(k,) for k in cohort_cases], ["v"]).select(
+        "v", F.array_sort(F.array_distinct(F.transform(
+            t._cohort_hits(F.col("v"), F.lit("condition")), lambda h: h["term"]))).alias("terms")).collect()
+    for r in rows:
+        assert r["terms"] == cohort_cases[r["v"]], (r["v"], r["terms"])
+    # A bare "WM" in a title doesn't count.
+    assert literal_df(spark, [("WM lesions on MRI",)], ["v"]).select(
+        F.size(t._cohort_hits(F.col("v"), F.lit("title"))).alias("n")).first()["n"] == 0
+
+    cohort = t.cohort_studies(gold).cache()
+    c = {r["nct_id"]: r for r in cohort.collect()}
+    assert set(c) == {"NCT00000001", "NCT00000006", "NCT00000009"}, set(c)
+    assert c["NCT00000001"]["disease_groups"] == ["WM"] and c["NCT00000001"]["matched_on"] == ["condition", "title"]
+    cohort_conditions = t.cohort_conditions(conditions, cohort)
+    lymphoma = cohort_conditions.where("nct_id = 'NCT00000009' AND condition = 'Lymphoma'").first()
+    assert lymphoma["matched_terms"] == [] and cohort_conditions.where("nct_id = 'NCT00000007'").count() == 0
+    cohort_criteria = {r["criterion_text"] for r in t.cohort_eligibility_criteria(criteria, cohort)
+                       .where("nct_id = 'NCT00000001'").collect()}
+    assert "Questions: call [phone removed] or email [email removed]" in cohort_criteria, cohort_criteria
+    assert t.cohort_outcomes(outcomes, cohort).where("nct_id = 'NCT00000001'").count() == 2
+
+    feats = {r["nct_id"]: r for r in t.trial_features(cohort, studies, criteria).collect()}
+    assert set(feats) == set(c)
+    f1 = feats["NCT00000001"]  # ibrutinib + ixazomib, RECRUITING, phase 2, 2 inclusion criteria
+    assert f1["ended_early"] is None and f1["is_ongoing"] and f1["start_year"] == 2018
+    assert f1["btk_inhibitor"] and not f1["bcl2_inhibitor"] and f1["n_drug_classes"] == 1
+    assert f1["phase"] == "PHASE2" and f1["allocation"] == "UNKNOWN" and f1["has_drug_intervention"]
+    assert f1["n_inclusion_criteria"] == 2 and f1["n_exclusion_criteria"] == 0 and f1["n_interventions"] == 3
+    assert set(feats["NCT00000001"].asDict()).isdisjoint({"enrollment_count", "has_results", "completion_date"})
 
     assert {r["nct_id"] for r in gold.collect()} == {"NCT00000001", "NCT00000006", "NCT00000009"}
     assert set(gold.columns).isdisjoint({"responsible_party_investigator_name", "payload", "raw_json"})

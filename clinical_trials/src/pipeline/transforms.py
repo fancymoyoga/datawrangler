@@ -437,7 +437,25 @@ def eligibility_criteria(latest: DataFrame) -> DataFrame:
     )
 
 
-OUTCOME_DETAIL_TYPE = "array<struct<measure:string,description:string,timeFrame:string>>"
+def conditions(latest: DataFrame) -> DataFrame:
+    """One row per condition per study, in the order the study lists them; blanks and
+    case-insensitive repeats within a study are dropped."""
+    exploded = latest.select("nct_id", F.posexplode("conditions").alias("pos", "condition")).select(
+        "nct_id", "pos", _blank_to_null(F.regexp_replace("condition", r"\s+", " ")).alias("condition"),
+    ).where(F.col("condition").isNotNull())
+    first_seen = Window.partitionBy("nct_id", F.lower("condition")).orderBy("pos")
+    by_position = Window.partitionBy("nct_id").orderBy("pos")
+    return (
+        exploded.withColumn("_rank", F.row_number().over(first_seen)).where("_rank = 1")
+        .withColumn("condition_number", F.row_number().over(by_position))
+        .select(
+            F.sha2(F.concat_ws("|", "nct_id", F.lower("condition")), 256).alias("condition_id"),
+            "nct_id", "condition_number", "condition",
+        )
+    )
+
+
+OUTCOME_DETAIL_TYPE ="array<struct<measure:string,description:string,timeFrame:string>>"
 OUTCOME_KINDS = (("primary", "primaryOutcomes"), ("secondary", "secondaryOutcomes"), ("other", "otherOutcomes"))
 
 
@@ -554,3 +572,201 @@ def documents(silver_studies: DataFrame) -> DataFrame:
 
 
 GOLD_RULES = _null_is_failure({"document_long_enough": f"document_chars >= {MIN_DOCUMENT_CHARS}"})
+
+
+# ---------------------------------------------------------------------------
+# Gold: chronic lymphocytic leukemia (CLL) / Waldenström macroglobulinemia (WM) cohort
+# ---------------------------------------------------------------------------
+
+# (term, disease group, pattern), run on lower-cased conditions, keywords and titles. Covers
+# spelling variants, MeSH-style inverted names ("Leukemia, Lymphocytic, Chronic, B-Cell") and
+# acronyms. SLL and Richter transformation count as CLL, lymphoplasmacytic lymphoma as WM;
+# matched_terms keeps them apart. Not matched: prolymphocytic, acute lymphocytic and T-cell
+# "chronic lymphocytic" leukemia (T-PLL), and Waldenström hypergammaglobulinemia.
+COHORT_TERMS = (
+    ("CLL", "CLL",
+     r"(?<!t[\s-]cell )chronic\s+(?:b[\s-]*(?:cell\s+)?)?lymph(?:ocytic|ocyte|oid|oma)\s+(?:b[\s-]*)?leu[ck]"
+     r"|lymphocytic\s+leu[ck]\w*,?\s+chronic"
+     r"|leu[ck]\w*,?\s+(?:lymphoma,?\s+)?(?:chronic\s+lymphocytic|lymphocytic,?\s+chronic)"
+     r"|\b(?:b-?)?cll\b"),
+    ("SLL", "CLL",
+     r"small\s+lymphocytic\s+(?:lymphoma|leu[ck])|(?:lymphoma|leu[ck]\w*),?\s+small\s+lymphocytic|\bsll\b"),
+    ("Richter transformation", "CLL", r"richter"),
+    ("WM", "WM", r"waldenstr(?:o|ö|oe)m(?!\W*hypergamma)|macroglobulina?emia"),
+    ("LPL", "WM", r"lymphoplasmac\w*\s+lymphoma|immunocytoma"),
+)
+# A bare "WM" only counts in conditions and keywords; in a title it can mean e.g. white matter.
+WM_ACRONYM = r"\bwm\b"
+COHORT_FIELDS_FOR_ACRONYM = ("condition", "keyword")
+
+
+def _cohort_hits(text: Column, field: Column) -> Column:
+    """array<struct<term, disease_group>> of the cohort terms the text matches."""
+    lowered = F.lower(text)
+    hits = [F.when(lowered.rlike(p), F.struct(F.lit(term).alias("term"), F.lit(group).alias("disease_group")))
+            for term, group, p in COHORT_TERMS]
+    hits.append(F.when(field.isin(*COHORT_FIELDS_FOR_ACRONYM) & lowered.rlike(WM_ACRONYM),
+                       F.struct(F.lit("WM").alias("term"), F.lit("WM").alias("disease_group"))))
+    return F.array_compact(F.array(*hits))
+
+
+def _tagged(field: str, array_col: str) -> Column:
+    return F.transform(F.coalesce(F.col(array_col), F.array().cast("array<string>")),
+                       lambda v: F.struct(F.lit(field).alias("field"), v.alias("text")))
+
+
+def cohort_matches(docs: DataFrame) -> DataFrame:
+    """One row per study that mentions CLL or WM in its conditions, keywords or titles."""
+    texts = F.concat(
+        _tagged("condition", "conditions"),
+        _tagged("keyword", "keywords"),
+        F.array(F.struct(F.lit("title").alias("field"), F.col("brief_title").alias("text")),
+                F.struct(F.lit("title").alias("field"), F.col("official_title").alias("text"))),
+    )
+    hits = (
+        docs.select("nct_id", F.explode(texts).alias("t"))
+        .where(F.col("t.text").isNotNull())
+        .select("nct_id", F.col("t.field").alias("field"),
+                F.explode(_cohort_hits(F.col("t.text"), F.col("t.field"))).alias("h"))
+    )
+    return hits.groupBy("nct_id").agg(
+        F.array_sort(F.collect_set("h.disease_group")).alias("disease_groups"),
+        F.array_sort(F.collect_set("h.term")).alias("matched_terms"),
+        F.array_sort(F.collect_set("field")).alias("matched_on"),
+    )
+
+
+def cohort_studies(docs: DataFrame) -> DataFrame:
+    """gold_study_documents rows for the cohort, with what matched and where."""
+    return docs.join(cohort_matches(docs), "nct_id")
+
+
+def cohort_conditions(conditions: DataFrame, cohort: DataFrame) -> DataFrame:
+    """Conditions of cohort studies; disease_groups / matched_terms say which ones are CLL or WM."""
+    hits = _cohort_hits(F.col("condition"), F.lit("condition"))
+    return conditions.join(cohort.select("nct_id"), "nct_id", "left_semi").select(
+        "condition_id", "nct_id", "condition_number", "condition",
+        F.array_sort(F.array_distinct(F.transform(hits, lambda h: h["disease_group"]))).alias("disease_groups"),
+        F.array_sort(F.array_distinct(F.transform(hits, lambda h: h["term"]))).alias("matched_terms"),
+    )
+
+
+def cohort_eligibility_criteria(criteria: DataFrame, cohort: DataFrame) -> DataFrame:
+    """Eligibility criteria of cohort studies, scrubbed of emails and phone numbers."""
+    return criteria.join(cohort.select("nct_id"), "nct_id", "left_semi").select(
+        "criterion_id", "nct_id", "criterion_type", "criterion_number",
+        scrub(F.col("criterion_text")).alias("criterion_text"),
+    )
+
+
+def cohort_outcomes(outcomes_df: DataFrame, cohort: DataFrame) -> DataFrame:
+    """Planned outcome measures of cohort studies, scrubbed of emails and phone numbers."""
+    return outcomes_df.join(cohort.select("nct_id"), "nct_id", "left_semi").select(
+        "outcome_id", "nct_id", "outcome_type", "outcome_number",
+        *[scrub(F.col(c)).alias(c) for c in ("measure", "description", "time_frame")],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gold: CLL trial features for the completion model (src/06_train_cll_trial_model.py)
+# ---------------------------------------------------------------------------
+
+# Label: did a finished trial end early? COMPLETED → 0, TERMINATED / WITHDRAWN → 1, anything
+# else (ongoing, UNKNOWN) → NULL, i.e. not trained on; ongoing trials are scored instead.
+ENDED_EARLY_STATUSES = ("TERMINATED", "WITHDRAWN")
+ONGOING_STATUSES = ("RECRUITING", "ACTIVE_NOT_RECRUITING", "NOT_YET_RECRUITING",
+                    "ENROLLING_BY_INVITATION", "SUSPENDED")
+
+# (feature, pattern) run on lower-cased intervention names + other names. Generic, brand and
+# code names of the main CLL treatment classes.
+DRUG_CLASSES = (
+    ("btk_inhibitor", r"ibrutinib|acalabrutinib|zanubrutinib|pirtobrutinib|orelabrutinib|nemtabrutinib"
+                      r"|tirabrutinib|imbruvica|calquence|brukinsa|jaypirca|pci-32765|acp-196|bgb-3111|loxo-305"),
+    ("bcl2_inhibitor", r"venetoclax|venclexta|abt-199|gdc-0199|sonrotoclax|bgb-11417|lisaftoclax|apg-2575"
+                       r"|navitoclax|abt-263"),
+    ("anti_cd20", r"rituximab|rituxan|mabthera|obinutuzumab|gazyva|ga101|ofatumumab|arzerra|ublituximab"
+                  r"|veltuzumab"),
+    ("pi3k_inhibitor", r"idelalisib|zydelig|cal-101|duvelisib|copiktra|ipi-145|umbralisib|copanlisib"
+                       r"|parsaclisib"),
+    ("chemotherapy", r"fludarabine|cyclophosphamide|bendamustine|chlorambucil|pentostatin|cladribine"
+                     r"|doxorubicin|vincristine|cytarabine|oxaliplatin|cisplatin|etoposide|\bfcr\b"),
+    ("anti_cd52", r"alemtuzumab|campath"),
+    ("immunomodulator", r"lenalidomide|revlimid|thalidomide|pomalidomide"),
+    ("cell_therapy", r"car[\s-]?t\b|chimeric antigen|lisocabtagene|liso-cel|tisagenlecleucel|axicabtagene"
+                     r"|\bnk cells?\b|donor lymphocyte"),
+    ("stem_cell_transplant", r"transplant|\bhsct\b|\bhct\b|stem cell"),
+    ("bispecific_antibody", r"epcoritamab|glofitamab|mosunetuzumab|odronextamab|blinatumomab|bispecific"),
+    ("corticosteroid", r"prednison|methylprednisolone|dexamethasone"),
+    ("vaccine", r"vaccin"),
+)
+INTERVENTION_TYPE_FLAGS = ("DRUG", "BIOLOGICAL", "PROCEDURE", "RADIATION", "BEHAVIORAL", "DEVICE",
+                           "DIETARY_SUPPLEMENT", "GENETIC", "OTHER")
+DESIGN = f"{PROTO}.designModule.designInfo"
+OTHER_NAMES_TYPE = "array<struct<name:string,otherNames:array<string>>>"
+
+
+def _category(c: Column) -> Column:
+    """Categorical feature: missing or blank → 'UNKNOWN', booleans as 'true' / 'false'."""
+    s = F.trim(c.cast("string"))
+    return F.when(s.isNull() | (s == ""), F.lit("UNKNOWN")).otherwise(F.upper(s))
+
+
+def trial_features(cohort: DataFrame, studies: DataFrame, criteria: DataFrame) -> DataFrame:
+    """One row per cohort study: design-time features and the ended_early label.
+
+    Features known when a trial is registered only. Left out because they record what happened
+    to the trial: enrollment (ACTUAL counts), results, completion dates and site lists (often
+    emptied when a trial is withdrawn).
+    """
+    interventions = _get(f"{PROTO}.armsInterventionsModule.interventions", OTHER_NAMES_TYPE)
+    design = studies.select(
+        "nct_id",
+        F.lower(F.concat_ws(" | ", F.flatten(F.transform(
+            F.coalesce(interventions, F.array()),
+            lambda i: F.concat(F.array(i["name"]), F.coalesce(i["otherNames"], F.array()))
+        )))).alias("_intervention_text"),
+        _category(_get(f"{DESIGN}.allocation", "string")).alias("allocation"),
+        _category(_get(f"{DESIGN}.interventionModel", "string")).alias("intervention_model"),
+        _category(_get(f"{DESIGN}.primaryPurpose", "string")).alias("primary_purpose"),
+        _category(_get(f"{DESIGN}.maskingInfo.masking", "string")).alias("masking"),
+        _category(_get(f"{PROTO}.oversightModule.oversightHasDmc", "boolean")).alias("has_dmc"),
+        _category(_get(f"{PROTO}.oversightModule.isFdaRegulatedDrug", "boolean")).alias("fda_regulated_drug"),
+        F.coalesce(F.size(_get(f"{PROTO}.sponsorCollaboratorsModule.collaborators", "array<variant>")),
+                   F.lit(0)).alias("n_collaborators"),
+        F.coalesce(F.size(_get(f"{PROTO}.armsInterventionsModule.armGroups", "array<variant>")),
+                   F.lit(0)).alias("n_arms"),
+    )
+    counts = criteria.groupBy("nct_id").agg(
+        F.count(F.when(F.col("criterion_type") == "inclusion", 1)).alias("n_inclusion_criteria"),
+        F.count(F.when(F.col("criterion_type") == "exclusion", 1)).alias("n_exclusion_criteria"),
+        F.count(F.when(F.col("criterion_type") == "unspecified", 1)).alias("n_unspecified_criteria"),
+    )
+    status = F.col("overall_status")
+    types = F.coalesce(F.col("intervention_types"), F.array())
+    df = cohort.join(design, "nct_id", "left").join(counts, "nct_id", "left")
+    flags = {c: F.col("_intervention_text").rlike(p) for c, p in DRUG_CLASSES}
+    return df.select(
+        "nct_id", "brief_title", "overall_status",
+        F.when(status == "COMPLETED", 0).when(status.isin(*ENDED_EARLY_STATUSES), 1).alias("ended_early"),
+        F.coalesce(status.isin(*ONGOING_STATUSES), F.lit(False)).alias("is_ongoing"),
+        F.year("start_date").alias("start_year"),
+        _category(F.array_join(F.array_sort("phases"), "/")).alias("phase"),
+        _category(F.col("study_type")).alias("study_type"),
+        _category(F.col("lead_sponsor_class")).alias("lead_sponsor_class"),
+        "allocation", "intervention_model", "primary_purpose", "masking", "has_dmc", "fda_regulated_drug",
+        "n_collaborators", "n_arms",
+        F.coalesce(F.size("intervention_names"), F.lit(0)).alias("n_interventions"),
+        *[F.array_contains(types, t).alias(f"has_{t.lower()}_intervention") for t in INTERVENTION_TYPE_FLAGS],
+        *[F.coalesce(v, F.lit(False)).alias(c) for c, v in flags.items()],
+        reduce(lambda a, b: a + b, [F.coalesce(v, F.lit(False)).cast("int") for v in flags.values()])
+        .alias("n_drug_classes"),
+        F.array_contains(F.col("disease_groups"), "WM").alias("also_wm"),
+        F.coalesce(F.size("conditions"), F.lit(0)).alias("n_conditions"),
+        F.coalesce(F.size("primary_outcome_measures"), F.lit(0)).alias("n_primary_outcomes"),
+        F.coalesce(F.size("secondary_outcome_measures"), F.lit(0)).alias("n_secondary_outcomes"),
+        *[F.coalesce(c, F.lit(0)).alias(c) for c in
+          ("n_inclusion_criteria", "n_exclusion_criteria", "n_unspecified_criteria")],
+        "minimum_age_years", "maximum_age_years",
+        _category(F.col("sex")).alias("sex"),
+        _category(F.col("healthy_volunteers")).alias("healthy_volunteers"),
+    )

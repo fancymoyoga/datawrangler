@@ -383,7 +383,7 @@ Databricks. The gold table feeds an AI model.
   (`new_cluster`, `job_clusters`, `clusters`, instance pools, `node_type_id`).
   Pipelines use `serverless: true`; job tasks use serverless environments.
 - **Catalogs**: `workspace` (`var.catalog`) holds the landing volume, `ingest_runs`, gold, the
-  vector index and the agent. Bronze and silver publish to `clinicaltrials` (`var.bronze_silver_catalog`),
+  vector index and the agent. Bronze, silver and the gold `gold_cll_wm_*` tables publish to `clinicaltrials` (`var.bronze_silver_catalog`),
   schema `${resources.schemas.clinical_trials_bronze_silver.name}`, via fully qualified dataset names
   built from the pipeline setting `bronze_silver_schema`.
 - **Packaging**: everything is a Databricks Asset Bundle (`databricks.yml` + `resources/`).
@@ -427,7 +427,8 @@ Databricks. The gold table feeds an AI model.
   tables), `silver_study_contacts` (PII), `silver_study_locations`,
   `silver_study_eligibility_criteria` (one row per inclusion/exclusion criterion split out of the
   eligibility markdown; text with no section headers is `unspecified`), `silver_study_outcomes`
-  (one row per primary/secondary/other planned outcome measure). Rules live in
+  (one row per primary/secondary/other planned outcome measure), `silver_study_conditions` (one row
+  per condition per study, case-insensitive repeats dropped). Rules live in
   `src/pipeline/transforms.py`; NULL rule results count as failures.
   Known gap: the `known_overall_status` rule hard-codes the status list instead of loading
   `/studies/enums` (development rule 9).
@@ -437,6 +438,22 @@ Databricks. The gold table feeds an AI model.
   skips pipeline-internal `__materialization_*` tables. Fails the run on direct identifiers in gold.
 - **Gold** `gold_study_documents`: allow-listed columns only; free text and `document_text`
   scrubbed of emails/phones; rows under 200 chars dropped; CDF on.
+- **Gold CLL / WM cohort** (in the `clinicaltrials` catalog): `gold_cll_wm_studies` (gold_study_documents rows whose conditions,
+  keywords or titles match `COHORT_TERMS` in transforms.py, plus `disease_groups`, `matched_terms`,
+  `matched_on`), and its child tables `gold_cll_wm_conditions`, `gold_cll_wm_eligibility_criteria`,
+  `gold_cll_wm_outcomes` (free text scrubbed). SLL and Richter count as CLL, LPL as WM; a bare "WM"
+  only counts in conditions/keywords. The PII gate in 02_tag_pii.py covers every `gold_*` table.
+- **CLL trial completion model** (`src/06_train_cll_trial_model.py`, job `cll_trial_model_job`, run
+  after `clinical_trials_job`): the pipeline MV `gold_cll_trial_features` (`trial_features` in
+  transforms.py) has design-time features of the CLL studies (phase, design, sponsor, `DRUG_CLASSES`
+  flags, criteria counts) and `ended_early` (1 = terminated/withdrawn, 0 = completed, NULL otherwise).
+  Enrollment, results, dates after start and site lists are left out because they leak the outcome.
+  Training uses only trials started by `max_train_start_year` (default 2019) and drops `start_year`:
+  of later trials, mostly early stops have finished, so recency would read as risk.
+  The notebook picks logistic regression or gradient boosting by 5-fold CV AUC, registers
+  `clinicaltrials.<schema>.cll_trial_completion_model` (alias `champion`), and overwrites
+  `gold_cll_trial_risk_scores` (ongoing trials) and `gold_cll_drug_class_summary`. It models trial
+  operations, not patient outcomes or treatment efficacy.
 - **Vector Search** (`src/03_vector_index.py`): Free Edition can't index materialized views, so gold
   is merged into the Delta table `gold_study_documents_vs_source`, and the Delta Sync index
   `gold_study_documents_index` (endpoint `clinical-trials-vs`, `databricks-gte-large-en`) syncs from it.
@@ -457,10 +474,11 @@ clinical_trials/
 │   ├── clinical_trials.pipeline.yml   # SDP pipeline (serverless, triggered)
 │   ├── clinical_trials.job.yml        # ingest → pipeline → tag PII → sync vector index
 │   ├── clinical_trials_agent.job.yml  # log, register and test the agent
+│   ├── cll_trial_model.job.yml        # train the CLL trial completion model
 │   └── study_contacts.job.yml         # FHIR loader (load_study_contacts.py)
 ├── src/
 │   ├── ctgov_client.py                # stdlib search client + envelope writer (shared)
-│   ├── 01_ingest_api.py … 05_test_agent.py
+│   ├── 01_ingest_api.py … 06_train_cll_trial_model.py
 │   ├── agent/agent.py                 # ResponsesAgent
 │   └── pipeline/                      # bronze.py, silver.py, gold.py, transforms.py
 ├── scripts/fetch_and_upload.py        # local fallback if compute can't reach the API
@@ -476,6 +494,7 @@ databricks bundle plan -t dev --profile monicaenders     # check for unexpected 
 databricks bundle deploy -t dev --profile monicaenders
 databricks bundle run clinical_trials_job -t dev --profile monicaenders
 databricks bundle run clinical_trials_agent_job -t dev --profile monicaenders
+databricks bundle run cll_trial_model_job -t dev --profile monicaenders
 
 # Local transform test: needs PySpark 4.0+, Java 17+, Python <= 3.13
 python tests/test_transforms.py

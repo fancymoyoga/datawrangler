@@ -3,4 +3,4 @@ resources:
     clinical_trials_bronze_silver:
       catalog_name: ${var.bronze_silver_catalog}
       name: clinical_trials
-      comment: ClinicalTrials.gov studies - bronze and silver layers (gold stays in the clinical_trials schema of var.catalog)
+      comment: ClinicalTrials.gov studies - bronze, silver and the gold CLL / WM cohort (gold_study_documents stays in var.catalog)

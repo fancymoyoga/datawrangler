@@ -72,6 +72,14 @@ def silver_study_eligibility_criteria():
 
 
 @dp.materialized_view(
+    name=f"{BRONZE_SILVER}.silver_study_conditions",
+    comment="One row per condition per study",
+)
+def silver_study_conditions():
+    return transforms.conditions(spark.read.table(f"{BRONZE_SILVER}.silver_studies"))
+
+
+@dp.materialized_view(
     name=f"{BRONZE_SILVER}.silver_study_outcomes",
     comment="One row per planned outcome measure (primary, secondary, other)",
 )
