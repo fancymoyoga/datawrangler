@@ -28,11 +28,14 @@ MAX_RETRIES = 4
 BACKOFF_BASE_SECONDS = 2.0
 MAX_RETRY_AFTER_SECONDS = 120
 TIMEOUT_SECONDS = 60
-PAGE_SIZE = 1000  # API maximum; about 12 MB of JSON per page with FIELDS below
+# Half the API maximum: with posted outcome results a 1,000-study page reaches ~20 MB, which
+# risks the 16 MB variant limit when silver parses it. 500 keeps a page around 10 MB.
+PAGE_SIZE = 500
 SEARCH_FOLDER = "search"
 
-# Silver and gold only read these, so result/derived/document sections stay out of bronze.
-FIELDS = ("protocolSection", "hasResults")
+# Silver and gold only read these. Of resultsSection only the outcome measures are kept;
+# adverse events, participant flow, baseline, derived and document sections stay out of bronze.
+FIELDS = ("protocolSection", "hasResults", "resultsSection.outcomeMeasuresModule")
 # Order matters because max_studies decides which studies are kept.
 SORT = ("@relevance",)
 

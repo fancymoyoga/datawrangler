@@ -403,9 +403,10 @@ Databricks. The gold table feeds an AI model.
 ## As built
 
 - **Landing** (`src/ctgov_client.py`, run by `src/01_ingest_api.py`): searches `/studies` with
-  `query.cond` (job param `condition`) and/or `query.term` (job param `search`), `fields=protocolSection|hasResults`, `sort=@relevance`, `pageSize=1000`, follows
+  `query.cond` (job param `condition`) and/or `query.term` (job param `search`), `fields=protocolSection|hasResults|resultsSection.outcomeMeasuresModule`, `sort=@relevance`,
+  `pageSize=500` (with results a 1,000-study page reaches ~20 MB, near the 16 MB variant limit), follows
   `nextPageToken` with the first page's parameters unchanged, and checks `/version` each run.
-  Each page lands as one envelope (about 12 MB for 1,000 studies) at
+  Each page lands as one envelope (about 10 MB for 500 studies) at
   `<volume>/studies/search/{yyyyMMddTHHmmssZ}_{ingest_id[:8]}_page{nnnn}.json`:
   `source_url, http_status, ingested_at, ingest_id, query, page, payload`, where `payload` is the
   page (`studies`, `nextPageToken`, `totalCount`). A failed page is landed with its error body and
@@ -428,7 +429,10 @@ Databricks. The gold table feeds an AI model.
   `silver_study_eligibility_criteria` (one row per inclusion/exclusion criterion split out of the
   eligibility markdown; text with no section headers is `unspecified`), `silver_study_outcomes`
   (one row per primary/secondary/other planned outcome measure), `silver_study_conditions` (one row
-  per condition per study, case-insensitive repeats dropped). Rules live in
+  per condition per study, case-insensitive repeats dropped), `silver_study_outcome_results` (posted
+  results: one row per study × outcome measure × arm/group × class × category, with `value`,
+  `value_numeric`, spread/CI limits and the arm's denominator). Studies landed before results were
+  added to `fields` have none until re-fetched with `incremental=false`. Rules live in
   `src/pipeline/transforms.py`; NULL rule results count as failures.
   Known gap: the `known_overall_status` rule hard-codes the status list instead of loading
   `/studies/enums` (development rule 9).
@@ -441,7 +445,8 @@ Databricks. The gold table feeds an AI model.
 - **Gold CLL / WM cohort** (in the `clinicaltrials` catalog): `gold_cll_wm_studies` (gold_study_documents rows whose conditions,
   keywords or titles match `COHORT_TERMS` in transforms.py, plus `disease_groups`, `matched_terms`,
   `matched_on`), and its child tables `gold_cll_wm_conditions`, `gold_cll_wm_eligibility_criteria`,
-  `gold_cll_wm_outcomes` (free text scrubbed). SLL and Richter count as CLL, LPL as WM; a bare "WM"
+  `gold_cll_wm_outcomes`, `gold_cll_wm_outcome_results` (posted results per arm plus
+  `arm_drug_classes` from the arm's title/description) (free text scrubbed). SLL and Richter count as CLL, LPL as WM; a bare "WM"
   only counts in conditions/keywords. The PII gate in 02_tag_pii.py covers every `gold_*` table.
 - **CLL trial completion model** (`src/06_train_cll_trial_model.py`, job `cll_trial_model_job`, run
   after `clinical_trials_job`): the pipeline MV `gold_cll_trial_features` (`trial_features` in

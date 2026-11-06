@@ -107,6 +107,19 @@ def study(nct_id, title="Ibrutinib in Waldenstrom Macroglobulinemia", status="RE
             },
         },
         "hasResults": True,
+        "resultsSection": {"outcomeMeasuresModule": {"outcomeMeasures": [
+            {"type": "PRIMARY", "title": "Overall Response Rate", "paramType": "NUMBER",
+             "dispersionType": "95% Confidence Interval", "unitOfMeasure": "percentage of participants",
+             "timeFrame": "Up to 2 years", "reportingStatus": "POSTED",
+             "groups": [{"id": "OG000", "title": "Ibrutinib + Ixazomib", "description": "Ibrutinib PO daily"},
+                        {"id": "OG001", "title": "Bendamustine + Rituximab"}],
+             "denoms": [{"units": "Participants", "counts": [{"groupId": "OG000", "value": "13"},
+                                                             {"groupId": "OG001", "value": "12"}]}],
+             "classes": [{"categories": [{"measurements": [
+                 {"groupId": "OG000", "value": "84.6", "lowerLimit": "54.6", "upperLimit": "98.1"},
+                 {"groupId": "OG001", "value": "NA", "comment": "Not estimable: call 555-123-4567"}]}]}]},
+            {"type": "SECONDARY", "title": "Progression-free survival", "reportingStatus": "NOT_POSTED"},
+        ]}},
     }
     for path, value in extra.items():
         node = s
@@ -330,6 +343,20 @@ def main():
                        .where("nct_id = 'NCT00000001'").collect()}
     assert "Questions: call [phone removed] or email [email removed]" in cohort_criteria, cohort_criteria
     assert t.cohort_outcomes(outcomes, cohort).where("nct_id = 'NCT00000001'").count() == 2
+
+    results = t.outcome_results(studies).cache()
+    r1 = {r["group_id"]: r for r in results.where("nct_id = 'NCT00000001'").collect()}
+    assert set(r1) == {"OG000", "OG001"}  # the NOT_POSTED measure has no values
+    assert r1["OG000"]["value_numeric"] == 84.6 and r1["OG000"]["upper_limit"] == 98.1
+    assert r1["OG000"]["group_title"] == "Ibrutinib + Ixazomib" and r1["OG000"]["denom_count"] == 13
+    assert r1["OG001"]["value"] == "NA" and r1["OG001"]["value_numeric"] is None
+    assert r1["OG001"]["outcome_type"] == "primary" and r1["OG001"]["group_description"] is None
+    assert results.select("result_id").distinct().count() == results.count()
+    arms = {r["group_id"]: r for r in t.cohort_outcome_results(results, cohort)
+            .where("nct_id = 'NCT00000001'").collect()}
+    assert arms["OG000"]["arm_drug_classes"] == ["btk_inhibitor"]
+    assert arms["OG001"]["arm_drug_classes"] == ["anti_cd20", "chemotherapy"]
+    assert "[phone removed]" in arms["OG001"]["value_comment"]
 
     feats = {r["nct_id"]: r for r in t.trial_features(cohort, studies, criteria).collect()}
     assert set(feats) == set(c)

@@ -85,3 +85,11 @@ def silver_study_conditions():
 )
 def silver_study_outcomes():
     return transforms.outcomes(spark.read.table(f"{BRONZE_SILVER}.silver_studies"))
+
+
+@dp.materialized_view(
+    name=f"{BRONZE_SILVER}.silver_study_outcome_results",
+    comment="Posted outcome results, one row per study, outcome measure, arm (group), class and category",
+)
+def silver_study_outcome_results():
+    return transforms.outcome_results(spark.read.table(f"{BRONZE_SILVER}.silver_studies"))

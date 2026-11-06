@@ -481,6 +481,67 @@ def outcomes(latest: DataFrame) -> DataFrame:
     )
 
 
+RESULTS = "resultsSection.outcomeMeasuresModule.outcomeMeasures"
+MEASUREMENT_TYPE = "struct<groupId:string,value:string,spread:string,lowerLimit:string,upperLimit:string,comment:string>"
+OUTCOME_RESULTS_TYPE = (
+    "array<struct<type:string,title:string,description:string,populationDescription:string,"
+    "reportingStatus:string,paramType:string,dispersionType:string,unitOfMeasure:string,timeFrame:string,"
+    "groups:array<struct<id:string,title:string,description:string>>,"
+    "denoms:array<struct<units:string,counts:array<struct<groupId:string,value:string>>>>,"
+    f"classes:array<struct<title:string,categories:array<struct<title:string,measurements:array<{MEASUREMENT_TYPE}>>>>>>>"
+)
+
+
+def outcome_results(latest: DataFrame) -> DataFrame:
+    """One row per posted outcome-measure value: study × measure × group (arm) × class × category.
+
+    From resultsSection.outcomeMeasuresModule. value is kept as posted (it can be "NA");
+    value_numeric is its number. spread / lower_limit / upper_limit follow dispersion_type.
+    """
+    measures = latest.select("nct_id", F.posexplode(_get(RESULTS, OUTCOME_RESULTS_TYPE)).alias("pos", "om"))
+    classes = measures.select("*", F.posexplode(F.coalesce("om.classes", F.array())).alias("class_pos", "cl"))
+    categories = classes.select(
+        "*", F.posexplode(F.coalesce("cl.categories", F.array())).alias("category_pos", "cat"))
+    rows = categories.select("*", F.explode(F.coalesce("cat.measurements", F.array())).alias("m"))
+    group = F.try_element_at(F.filter("om.groups", lambda g: g["id"] == F.col("m.groupId")), F.lit(1))
+    denom = F.try_element_at("om.denoms", F.lit(1))
+    denom_count = F.try_element_at(
+        F.filter(denom["counts"], lambda c: c["groupId"] == F.col("m.groupId")), F.lit(1))["value"]
+    out = rows.select(
+        "nct_id",
+        (F.col("pos") + 1).alias("outcome_number"),
+        F.lower("om.type").alias("outcome_type"),
+        _blank_to_null(F.col("om.title")).alias("measure"),
+        _blank_to_null(F.col("om.description")).alias("description"),
+        _blank_to_null(F.col("om.timeFrame")).alias("time_frame"),
+        _blank_to_null(F.col("om.populationDescription")).alias("population_description"),
+        F.col("om.reportingStatus").alias("reporting_status"),
+        F.col("om.paramType").alias("param_type"),
+        F.col("om.dispersionType").alias("dispersion_type"),
+        _blank_to_null(F.col("om.unitOfMeasure")).alias("unit_of_measure"),
+        F.col("m.groupId").alias("group_id"),
+        _blank_to_null(group["title"]).alias("group_title"),
+        _blank_to_null(group["description"]).alias("group_description"),
+        (F.col("class_pos") + 1).alias("class_number"),
+        _blank_to_null(F.col("cl.title")).alias("class_title"),
+        (F.col("category_pos") + 1).alias("category_number"),
+        _blank_to_null(F.col("cat.title")).alias("category_title"),
+        _blank_to_null(F.col("m.value")).alias("value"),
+        F.col("m.value").try_cast("double").alias("value_numeric"),
+        F.col("m.spread").try_cast("double").alias("spread"),
+        F.col("m.lowerLimit").try_cast("double").alias("lower_limit"),
+        F.col("m.upperLimit").try_cast("double").alias("upper_limit"),
+        _blank_to_null(F.col("m.comment")).alias("value_comment"),
+        _blank_to_null(denom["units"]).alias("denom_units"),
+        denom_count.try_cast("int").alias("denom_count"),
+    )
+    return out.select(
+        F.sha2(F.concat_ws("|", "nct_id", "outcome_number", "class_number", "category_number", "group_id"),
+               256).alias("result_id"),
+        *out.columns,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gold
 # ---------------------------------------------------------------------------
@@ -770,3 +831,20 @@ def trial_features(cohort: DataFrame, studies: DataFrame, criteria: DataFrame) -
         _category(F.col("sex")).alias("sex"),
         _category(F.col("healthy_volunteers")).alias("healthy_volunteers"),
     )
+
+
+RESULT_TEXT_COLUMNS = ("measure", "description", "time_frame", "population_description", "group_title",
+                       "group_description", "class_title", "category_title", "value_comment")
+
+
+def cohort_outcome_results(results: DataFrame, cohort: DataFrame) -> DataFrame:
+    """Posted outcome results of cohort studies, free text scrubbed, with the arm's DRUG_CLASSES.
+
+    arm_drug_classes comes from the group (arm) title and description, so in a randomized trial
+    each arm gets its own classes, e.g. ["chemotherapy"] vs ["anti_cd20", "chemotherapy"].
+    """
+    arm_text = F.lower(F.concat_ws(" | ", "group_title", "group_description"))
+    classes = F.array_compact(F.array(*[F.when(arm_text.rlike(p), F.lit(c)) for c, p in DRUG_CLASSES]))
+    return (results.join(cohort.select("nct_id"), "nct_id", "left_semi")
+            .withColumns({c: scrub(F.col(c)) for c in RESULT_TEXT_COLUMNS})
+            .withColumn("arm_drug_classes", classes))

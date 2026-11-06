@@ -66,3 +66,14 @@ def gold_cll_trial_features():
     return transforms.trial_features(
         cll, spark.read.table(f"{BRONZE_SILVER}.silver_studies"),
         spark.read.table(f"{BRONZE_SILVER}.silver_study_eligibility_criteria"))
+
+
+@dp.materialized_view(
+    name=f"{BRONZE_SILVER}.gold_cll_wm_outcome_results",
+    comment="Posted outcome results of the CLL / WM studies per arm, with each arm's drug classes "
+            "(free text scrubbed). Values as reported by each trial; not comparable across trials.",
+)
+def gold_cll_wm_outcome_results():
+    return transforms.cohort_outcome_results(
+        spark.read.table(f"{BRONZE_SILVER}.silver_study_outcome_results"),
+        spark.read.table(f"{BRONZE_SILVER}.gold_cll_wm_studies"))
