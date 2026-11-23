@@ -1,0 +1,18 @@
+resources:
+  jobs:
+    cll_trial_model_job:
+      name: cll_trial_model_job
+      max_concurrent_runs: 1
+      # Serverless: no cluster config anywhere (Free Edition). Run after clinical_trials_job.
+      parameters:
+        - name: catalog
+          default: ${var.bronze_silver_catalog}
+        - name: schema
+          default: ${resources.schemas.clinical_trials_bronze_silver.name}
+        - name: max_train_start_year
+          # Train only on trials started by this year; later finished ones are mostly early stops.
+          default: "2019"
+      tasks:
+        - task_key: train_cll_trial_model
+          notebook_task:
+            notebook_path: ../src/06_train_cll_trial_model.py

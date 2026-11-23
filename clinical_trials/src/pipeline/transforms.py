@@ -4,6 +4,8 @@ Plain functions (DataFrame in, DataFrame out) so they can be unit-tested with lo
 PySpark. bronze.py / silver.py / gold.py wrap them in Spark Declarative Pipeline datasets.
 """
 
+from functools import reduce
+
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 
@@ -372,6 +374,175 @@ def locations(latest: DataFrame) -> DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Silver: eligibility criteria and outcomes
+# ---------------------------------------------------------------------------
+
+# A section header line in eligibilityCriteria: "Inclusion Criteria:", "**Key Exclusion Criteria**",
+# "EXCLUSION CRITERIA (Cohort 2):". Group 1 is the section, group 2 any text after the colon.
+CRITERIA_HEADER = (
+    r"(?i)^[\s*#_>-]*(?:key\s+|main\s+|major\s+|general\s+)?(inclusion|exclusion)\s+criteri(?:a|on)"
+    r"(?:\s*\([^)]*\)|\s+for\s+[^:]{1,60})?[\s*_]*(?::|$)[\s*_]*(.*)$"
+)
+# A list item: "* text", "- text", "1. text", "a) text". Group 1 is the indent, group 2 the text.
+CRITERIA_BULLET = r"^(\s*)(?:[*•+-]|\d{1,3}[.)]|[a-zA-Z][.)])\s+(.*)$"
+
+
+def eligibility_criteria(latest: DataFrame) -> DataFrame:
+    """One row per inclusion / exclusion criterion, split out of the eligibilityCriteria text.
+
+    Each top-level list item is one criterion; its sub-items and wrapped lines are joined onto it.
+    A section without list items gives one criterion per non-blank line. Text before the first
+    section header has criterion_type 'unspecified'.
+    """
+    by_line = Window.partitionBy("nct_id").orderBy("line_no")
+    # ClinicalTrials.gov markdown escapes punctuation ("\>= 18 years"); unescape it first.
+    text = F.regexp_replace("eligibility_criteria", r"\\([^\w\s])", "$1")
+    lines = (
+        latest.select("nct_id", F.posexplode(F.split(text, r"\r?\n")).alias("line_no", "line"))
+        .withColumn("_header", F.lower(F.regexp_extract("line", CRITERIA_HEADER, 1)))
+        .withColumn("_content", F.when(F.col("_header") != "",
+                                       F.regexp_extract("line", CRITERIA_HEADER, 2)).otherwise(F.col("line")))
+        .withColumn("criterion_type", F.coalesce(
+            F.last(F.when(F.col("_header") != "", F.col("_header")), ignorenulls=True).over(
+                by_line.rowsBetween(Window.unboundedPreceding, Window.currentRow)),
+            F.lit("unspecified")))
+        .withColumn("_is_bullet", F.col("_content").rlike(CRITERIA_BULLET))
+        .withColumn("_indent", F.when(
+            F.col("_is_bullet"), F.length(F.regexp_extract("_content", CRITERIA_BULLET, 1))))
+        .withColumn("_text", F.trim(F.when(F.col("_is_bullet"), F.regexp_extract("_content", CRITERIA_BULLET, 2))
+                                    .otherwise(F.col("_content"))))
+        .where(F.col("_text") != "")
+    )
+    section = Window.partitionBy("nct_id", "criterion_type")
+    # A top-level item starts at the least-indented list marker; with no markers, every line does.
+    starts = F.when(F.col("_top_indent").isNull(), True).otherwise(
+        F.coalesce(F.col("_indent") <= F.col("_top_indent"), F.lit(False)))
+    items = (
+        lines.withColumn("_top_indent", F.min("_indent").over(section))
+        .withColumn("_start", starts.cast("int"))
+        .withColumn("_item", F.sum("_start").over(
+            section.orderBy("line_no").rowsBetween(Window.unboundedPreceding, Window.currentRow)))
+        .groupBy("nct_id", "criterion_type", "_item")
+        .agg(F.min("line_no").alias("_first_line"),
+             F.array_sort(F.collect_list(F.struct("line_no", "_text"))).alias("_lines"))
+        .select("nct_id", "criterion_type", "_first_line",
+                F.regexp_replace(F.array_join(F.transform("_lines", lambda x: x["_text"]), " "),
+                                 r"\s+", " ").alias("criterion_text"))
+        .withColumn("criterion_number", F.row_number().over(
+            Window.partitionBy("nct_id", "criterion_type").orderBy("_first_line")))
+    )
+    return items.select(
+        F.sha2(F.concat_ws("|", "nct_id", "criterion_type", "criterion_number"), 256).alias("criterion_id"),
+        "nct_id", "criterion_type", "criterion_number", "criterion_text",
+    )
+
+
+def conditions(latest: DataFrame) -> DataFrame:
+    """One row per condition per study, in the order the study lists them; blanks and
+    case-insensitive repeats within a study are dropped."""
+    exploded = latest.select("nct_id", F.posexplode("conditions").alias("pos", "condition")).select(
+        "nct_id", "pos", _blank_to_null(F.regexp_replace("condition", r"\s+", " ")).alias("condition"),
+    ).where(F.col("condition").isNotNull())
+    first_seen = Window.partitionBy("nct_id", F.lower("condition")).orderBy("pos")
+    by_position = Window.partitionBy("nct_id").orderBy("pos")
+    return (
+        exploded.withColumn("_rank", F.row_number().over(first_seen)).where("_rank = 1")
+        .withColumn("condition_number", F.row_number().over(by_position))
+        .select(
+            F.sha2(F.concat_ws("|", "nct_id", F.lower("condition")), 256).alias("condition_id"),
+            "nct_id", "condition_number", "condition",
+        )
+    )
+
+
+OUTCOME_DETAIL_TYPE ="array<struct<measure:string,description:string,timeFrame:string>>"
+OUTCOME_KINDS = (("primary", "primaryOutcomes"), ("secondary", "secondaryOutcomes"), ("other", "otherOutcomes"))
+
+
+def outcomes(latest: DataFrame) -> DataFrame:
+    """One row per planned outcome measure (primary, secondary, other pre-specified)."""
+    parts = [
+        latest.select("nct_id", F.posexplode(_get(f"{PROTO}.outcomesModule.{field}", OUTCOME_DETAIL_TYPE))
+                      .alias("pos", "o"))
+        .select(
+            "nct_id",
+            F.lit(kind).alias("outcome_type"),
+            (F.col("pos") + 1).alias("outcome_number"),
+            _blank_to_null(F.col("o.measure")).alias("measure"),
+            _blank_to_null(F.col("o.description")).alias("description"),
+            _blank_to_null(F.col("o.timeFrame")).alias("time_frame"),
+        )
+        for kind, field in OUTCOME_KINDS
+    ]
+    all_outcomes = reduce(DataFrame.unionByName, parts).where(F.col("measure").isNotNull())
+    return all_outcomes.select(
+        F.sha2(F.concat_ws("|", "nct_id", "outcome_type", "outcome_number"), 256).alias("outcome_id"),
+        *all_outcomes.columns,
+    )
+
+
+RESULTS = "resultsSection.outcomeMeasuresModule.outcomeMeasures"
+MEASUREMENT_TYPE = "struct<groupId:string,value:string,spread:string,lowerLimit:string,upperLimit:string,comment:string>"
+OUTCOME_RESULTS_TYPE = (
+    "array<struct<type:string,title:string,description:string,populationDescription:string,"
+    "reportingStatus:string,paramType:string,dispersionType:string,unitOfMeasure:string,timeFrame:string,"
+    "groups:array<struct<id:string,title:string,description:string>>,"
+    "denoms:array<struct<units:string,counts:array<struct<groupId:string,value:string>>>>,"
+    f"classes:array<struct<title:string,categories:array<struct<title:string,measurements:array<{MEASUREMENT_TYPE}>>>>>>>"
+)
+
+
+def outcome_results(latest: DataFrame) -> DataFrame:
+    """One row per posted outcome-measure value: study × measure × group (arm) × class × category.
+
+    From resultsSection.outcomeMeasuresModule. value is kept as posted (it can be "NA");
+    value_numeric is its number. spread / lower_limit / upper_limit follow dispersion_type.
+    """
+    measures = latest.select("nct_id", F.posexplode(_get(RESULTS, OUTCOME_RESULTS_TYPE)).alias("pos", "om"))
+    classes = measures.select("*", F.posexplode(F.coalesce("om.classes", F.array())).alias("class_pos", "cl"))
+    categories = classes.select(
+        "*", F.posexplode(F.coalesce("cl.categories", F.array())).alias("category_pos", "cat"))
+    rows = categories.select("*", F.explode(F.coalesce("cat.measurements", F.array())).alias("m"))
+    group = F.try_element_at(F.filter("om.groups", lambda g: g["id"] == F.col("m.groupId")), F.lit(1))
+    denom = F.try_element_at("om.denoms", F.lit(1))
+    denom_count = F.try_element_at(
+        F.filter(denom["counts"], lambda c: c["groupId"] == F.col("m.groupId")), F.lit(1))["value"]
+    out = rows.select(
+        "nct_id",
+        (F.col("pos") + 1).alias("outcome_number"),
+        F.lower("om.type").alias("outcome_type"),
+        _blank_to_null(F.col("om.title")).alias("measure"),
+        _blank_to_null(F.col("om.description")).alias("description"),
+        _blank_to_null(F.col("om.timeFrame")).alias("time_frame"),
+        _blank_to_null(F.col("om.populationDescription")).alias("population_description"),
+        F.col("om.reportingStatus").alias("reporting_status"),
+        F.col("om.paramType").alias("param_type"),
+        F.col("om.dispersionType").alias("dispersion_type"),
+        _blank_to_null(F.col("om.unitOfMeasure")).alias("unit_of_measure"),
+        F.col("m.groupId").alias("group_id"),
+        _blank_to_null(group["title"]).alias("group_title"),
+        _blank_to_null(group["description"]).alias("group_description"),
+        (F.col("class_pos") + 1).alias("class_number"),
+        _blank_to_null(F.col("cl.title")).alias("class_title"),
+        (F.col("category_pos") + 1).alias("category_number"),
+        _blank_to_null(F.col("cat.title")).alias("category_title"),
+        _blank_to_null(F.col("m.value")).alias("value"),
+        F.col("m.value").try_cast("double").alias("value_numeric"),
+        F.col("m.spread").try_cast("double").alias("spread"),
+        F.col("m.lowerLimit").try_cast("double").alias("lower_limit"),
+        F.col("m.upperLimit").try_cast("double").alias("upper_limit"),
+        _blank_to_null(F.col("m.comment")).alias("value_comment"),
+        _blank_to_null(denom["units"]).alias("denom_units"),
+        denom_count.try_cast("int").alias("denom_count"),
+    )
+    return out.select(
+        F.sha2(F.concat_ws("|", "nct_id", "outcome_number", "class_number", "category_number", "group_id"),
+               256).alias("result_id"),
+        *out.columns,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Gold
 # ---------------------------------------------------------------------------
 
@@ -462,3 +633,218 @@ def documents(silver_studies: DataFrame) -> DataFrame:
 
 
 GOLD_RULES = _null_is_failure({"document_long_enough": f"document_chars >= {MIN_DOCUMENT_CHARS}"})
+
+
+# ---------------------------------------------------------------------------
+# Gold: chronic lymphocytic leukemia (CLL) / Waldenström macroglobulinemia (WM) cohort
+# ---------------------------------------------------------------------------
+
+# (term, disease group, pattern), run on lower-cased conditions, keywords and titles. Covers
+# spelling variants, MeSH-style inverted names ("Leukemia, Lymphocytic, Chronic, B-Cell") and
+# acronyms. SLL and Richter transformation count as CLL, lymphoplasmacytic lymphoma as WM;
+# matched_terms keeps them apart. Not matched: prolymphocytic, acute lymphocytic and T-cell
+# "chronic lymphocytic" leukemia (T-PLL), and Waldenström hypergammaglobulinemia.
+COHORT_TERMS = (
+    ("CLL", "CLL",
+     r"(?<!t[\s-]cell )chronic\s+(?:b[\s-]*(?:cell\s+)?)?lymph(?:ocytic|ocyte|oid|oma)\s+(?:b[\s-]*)?leu[ck]"
+     r"|lymphocytic\s+leu[ck]\w*,?\s+chronic"
+     r"|leu[ck]\w*,?\s+(?:lymphoma,?\s+)?(?:chronic\s+lymphocytic|lymphocytic,?\s+chronic)"
+     r"|\b(?:b-?)?cll\b"),
+    ("SLL", "CLL",
+     r"small\s+lymphocytic\s+(?:lymphoma|leu[ck])|(?:lymphoma|leu[ck]\w*),?\s+small\s+lymphocytic|\bsll\b"),
+    ("Richter transformation", "CLL", r"richter"),
+    ("WM", "WM", r"waldenstr(?:o|ö|oe)m(?!\W*hypergamma)|macroglobulina?emia"),
+    ("LPL", "WM", r"lymphoplasmac\w*\s+lymphoma|immunocytoma"),
+)
+# A bare "WM" only counts in conditions and keywords; in a title it can mean e.g. white matter.
+WM_ACRONYM = r"\bwm\b"
+COHORT_FIELDS_FOR_ACRONYM = ("condition", "keyword")
+
+
+def _cohort_hits(text: Column, field: Column) -> Column:
+    """array<struct<term, disease_group>> of the cohort terms the text matches."""
+    lowered = F.lower(text)
+    hits = [F.when(lowered.rlike(p), F.struct(F.lit(term).alias("term"), F.lit(group).alias("disease_group")))
+            for term, group, p in COHORT_TERMS]
+    hits.append(F.when(field.isin(*COHORT_FIELDS_FOR_ACRONYM) & lowered.rlike(WM_ACRONYM),
+                       F.struct(F.lit("WM").alias("term"), F.lit("WM").alias("disease_group"))))
+    return F.array_compact(F.array(*hits))
+
+
+def _tagged(field: str, array_col: str) -> Column:
+    return F.transform(F.coalesce(F.col(array_col), F.array().cast("array<string>")),
+                       lambda v: F.struct(F.lit(field).alias("field"), v.alias("text")))
+
+
+def cohort_matches(docs: DataFrame) -> DataFrame:
+    """One row per study that mentions CLL or WM in its conditions, keywords or titles."""
+    texts = F.concat(
+        _tagged("condition", "conditions"),
+        _tagged("keyword", "keywords"),
+        F.array(F.struct(F.lit("title").alias("field"), F.col("brief_title").alias("text")),
+                F.struct(F.lit("title").alias("field"), F.col("official_title").alias("text"))),
+    )
+    hits = (
+        docs.select("nct_id", F.explode(texts).alias("t"))
+        .where(F.col("t.text").isNotNull())
+        .select("nct_id", F.col("t.field").alias("field"),
+                F.explode(_cohort_hits(F.col("t.text"), F.col("t.field"))).alias("h"))
+    )
+    return hits.groupBy("nct_id").agg(
+        F.array_sort(F.collect_set("h.disease_group")).alias("disease_groups"),
+        F.array_sort(F.collect_set("h.term")).alias("matched_terms"),
+        F.array_sort(F.collect_set("field")).alias("matched_on"),
+    )
+
+
+def cohort_studies(docs: DataFrame) -> DataFrame:
+    """gold_study_documents rows for the cohort, with what matched and where."""
+    return docs.join(cohort_matches(docs), "nct_id")
+
+
+def cohort_conditions(conditions: DataFrame, cohort: DataFrame) -> DataFrame:
+    """Conditions of cohort studies; disease_groups / matched_terms say which ones are CLL or WM."""
+    hits = _cohort_hits(F.col("condition"), F.lit("condition"))
+    return conditions.join(cohort.select("nct_id"), "nct_id", "left_semi").select(
+        "condition_id", "nct_id", "condition_number", "condition",
+        F.array_sort(F.array_distinct(F.transform(hits, lambda h: h["disease_group"]))).alias("disease_groups"),
+        F.array_sort(F.array_distinct(F.transform(hits, lambda h: h["term"]))).alias("matched_terms"),
+    )
+
+
+def cohort_eligibility_criteria(criteria: DataFrame, cohort: DataFrame) -> DataFrame:
+    """Eligibility criteria of cohort studies, scrubbed of emails and phone numbers."""
+    return criteria.join(cohort.select("nct_id"), "nct_id", "left_semi").select(
+        "criterion_id", "nct_id", "criterion_type", "criterion_number",
+        scrub(F.col("criterion_text")).alias("criterion_text"),
+    )
+
+
+def cohort_outcomes(outcomes_df: DataFrame, cohort: DataFrame) -> DataFrame:
+    """Planned outcome measures of cohort studies, scrubbed of emails and phone numbers."""
+    return outcomes_df.join(cohort.select("nct_id"), "nct_id", "left_semi").select(
+        "outcome_id", "nct_id", "outcome_type", "outcome_number",
+        *[scrub(F.col(c)).alias(c) for c in ("measure", "description", "time_frame")],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gold: CLL trial features for the completion model (src/06_train_cll_trial_model.py)
+# ---------------------------------------------------------------------------
+
+# Label: did a finished trial end early? COMPLETED → 0, TERMINATED / WITHDRAWN → 1, anything
+# else (ongoing, UNKNOWN) → NULL, i.e. not trained on; ongoing trials are scored instead.
+ENDED_EARLY_STATUSES = ("TERMINATED", "WITHDRAWN")
+ONGOING_STATUSES = ("RECRUITING", "ACTIVE_NOT_RECRUITING", "NOT_YET_RECRUITING",
+                    "ENROLLING_BY_INVITATION", "SUSPENDED")
+
+# (feature, pattern) run on lower-cased intervention names + other names. Generic, brand and
+# code names of the main CLL treatment classes.
+DRUG_CLASSES = (
+    ("btk_inhibitor", r"ibrutinib|acalabrutinib|zanubrutinib|pirtobrutinib|orelabrutinib|nemtabrutinib"
+                      r"|tirabrutinib|imbruvica|calquence|brukinsa|jaypirca|pci-32765|acp-196|bgb-3111|loxo-305"),
+    ("bcl2_inhibitor", r"venetoclax|venclexta|abt-199|gdc-0199|sonrotoclax|bgb-11417|lisaftoclax|apg-2575"
+                       r"|navitoclax|abt-263"),
+    ("anti_cd20", r"rituximab|rituxan|mabthera|obinutuzumab|gazyva|ga101|ofatumumab|arzerra|ublituximab"
+                  r"|veltuzumab"),
+    ("pi3k_inhibitor", r"idelalisib|zydelig|cal-101|duvelisib|copiktra|ipi-145|umbralisib|copanlisib"
+                       r"|parsaclisib"),
+    ("chemotherapy", r"fludarabine|cyclophosphamide|bendamustine|chlorambucil|pentostatin|cladribine"
+                     r"|doxorubicin|vincristine|cytarabine|oxaliplatin|cisplatin|etoposide|\bfcr\b"),
+    ("anti_cd52", r"alemtuzumab|campath"),
+    ("immunomodulator", r"lenalidomide|revlimid|thalidomide|pomalidomide"),
+    ("cell_therapy", r"car[\s-]?t\b|chimeric antigen|lisocabtagene|liso-cel|tisagenlecleucel|axicabtagene"
+                     r"|\bnk cells?\b|donor lymphocyte"),
+    ("stem_cell_transplant", r"transplant|\bhsct\b|\bhct\b|stem cell"),
+    ("bispecific_antibody", r"epcoritamab|glofitamab|mosunetuzumab|odronextamab|blinatumomab|bispecific"),
+    ("corticosteroid", r"prednison|methylprednisolone|dexamethasone"),
+    ("vaccine", r"vaccin"),
+)
+INTERVENTION_TYPE_FLAGS = ("DRUG", "BIOLOGICAL", "PROCEDURE", "RADIATION", "BEHAVIORAL", "DEVICE",
+                           "DIETARY_SUPPLEMENT", "GENETIC", "OTHER")
+DESIGN = f"{PROTO}.designModule.designInfo"
+OTHER_NAMES_TYPE = "array<struct<name:string,otherNames:array<string>>>"
+
+
+def _category(c: Column) -> Column:
+    """Categorical feature: missing or blank → 'UNKNOWN', booleans as 'true' / 'false'."""
+    s = F.trim(c.cast("string"))
+    return F.when(s.isNull() | (s == ""), F.lit("UNKNOWN")).otherwise(F.upper(s))
+
+
+def trial_features(cohort: DataFrame, studies: DataFrame, criteria: DataFrame) -> DataFrame:
+    """One row per cohort study: design-time features and the ended_early label.
+
+    Features known when a trial is registered only. Left out because they record what happened
+    to the trial: enrollment (ACTUAL counts), results, completion dates and site lists (often
+    emptied when a trial is withdrawn).
+    """
+    interventions = _get(f"{PROTO}.armsInterventionsModule.interventions", OTHER_NAMES_TYPE)
+    design = studies.select(
+        "nct_id",
+        F.lower(F.concat_ws(" | ", F.flatten(F.transform(
+            F.coalesce(interventions, F.array()),
+            lambda i: F.concat(F.array(i["name"]), F.coalesce(i["otherNames"], F.array()))
+        )))).alias("_intervention_text"),
+        _category(_get(f"{DESIGN}.allocation", "string")).alias("allocation"),
+        _category(_get(f"{DESIGN}.interventionModel", "string")).alias("intervention_model"),
+        _category(_get(f"{DESIGN}.primaryPurpose", "string")).alias("primary_purpose"),
+        _category(_get(f"{DESIGN}.maskingInfo.masking", "string")).alias("masking"),
+        _category(_get(f"{PROTO}.oversightModule.oversightHasDmc", "boolean")).alias("has_dmc"),
+        _category(_get(f"{PROTO}.oversightModule.isFdaRegulatedDrug", "boolean")).alias("fda_regulated_drug"),
+        F.coalesce(F.size(_get(f"{PROTO}.sponsorCollaboratorsModule.collaborators", "array<variant>")),
+                   F.lit(0)).alias("n_collaborators"),
+        F.coalesce(F.size(_get(f"{PROTO}.armsInterventionsModule.armGroups", "array<variant>")),
+                   F.lit(0)).alias("n_arms"),
+    )
+    counts = criteria.groupBy("nct_id").agg(
+        F.count(F.when(F.col("criterion_type") == "inclusion", 1)).alias("n_inclusion_criteria"),
+        F.count(F.when(F.col("criterion_type") == "exclusion", 1)).alias("n_exclusion_criteria"),
+        F.count(F.when(F.col("criterion_type") == "unspecified", 1)).alias("n_unspecified_criteria"),
+    )
+    status = F.col("overall_status")
+    types = F.coalesce(F.col("intervention_types"), F.array())
+    df = cohort.join(design, "nct_id", "left").join(counts, "nct_id", "left")
+    flags = {c: F.col("_intervention_text").rlike(p) for c, p in DRUG_CLASSES}
+    return df.select(
+        "nct_id", "brief_title", "overall_status",
+        F.when(status == "COMPLETED", 0).when(status.isin(*ENDED_EARLY_STATUSES), 1).alias("ended_early"),
+        F.coalesce(status.isin(*ONGOING_STATUSES), F.lit(False)).alias("is_ongoing"),
+        F.year("start_date").alias("start_year"),
+        _category(F.array_join(F.array_sort("phases"), "/")).alias("phase"),
+        _category(F.col("study_type")).alias("study_type"),
+        _category(F.col("lead_sponsor_class")).alias("lead_sponsor_class"),
+        "allocation", "intervention_model", "primary_purpose", "masking", "has_dmc", "fda_regulated_drug",
+        "n_collaborators", "n_arms",
+        F.coalesce(F.size("intervention_names"), F.lit(0)).alias("n_interventions"),
+        *[F.array_contains(types, t).alias(f"has_{t.lower()}_intervention") for t in INTERVENTION_TYPE_FLAGS],
+        *[F.coalesce(v, F.lit(False)).alias(c) for c, v in flags.items()],
+        reduce(lambda a, b: a + b, [F.coalesce(v, F.lit(False)).cast("int") for v in flags.values()])
+        .alias("n_drug_classes"),
+        F.array_contains(F.col("disease_groups"), "WM").alias("also_wm"),
+        F.coalesce(F.size("conditions"), F.lit(0)).alias("n_conditions"),
+        F.coalesce(F.size("primary_outcome_measures"), F.lit(0)).alias("n_primary_outcomes"),
+        F.coalesce(F.size("secondary_outcome_measures"), F.lit(0)).alias("n_secondary_outcomes"),
+        *[F.coalesce(c, F.lit(0)).alias(c) for c in
+          ("n_inclusion_criteria", "n_exclusion_criteria", "n_unspecified_criteria")],
+        "minimum_age_years", "maximum_age_years",
+        _category(F.col("sex")).alias("sex"),
+        _category(F.col("healthy_volunteers")).alias("healthy_volunteers"),
+    )
+
+
+RESULT_TEXT_COLUMNS = ("measure", "description", "time_frame", "population_description", "group_title",
+                       "group_description", "class_title", "category_title", "value_comment")
+
+
+def cohort_outcome_results(results: DataFrame, cohort: DataFrame) -> DataFrame:
+    """Posted outcome results of cohort studies, free text scrubbed, with the arm's DRUG_CLASSES.
+
+    arm_drug_classes comes from the group (arm) title and description, so in a randomized trial
+    each arm gets its own classes, e.g. ["chemotherapy"] vs ["anti_cd20", "chemotherapy"].
+    """
+    arm_text = F.lower(F.concat_ws(" | ", "group_title", "group_description"))
+    classes = F.array_compact(F.array(*[F.when(arm_text.rlike(p), F.lit(c)) for c, p in DRUG_CLASSES]))
+    return (results.join(cohort.select("nct_id"), "nct_id", "left_semi")
+            .withColumns({c: scrub(F.col(c)) for c in RESULT_TEXT_COLUMNS})
+            .withColumn("arm_drug_classes", classes))

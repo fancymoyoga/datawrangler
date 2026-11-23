@@ -12,6 +12,10 @@ resources:
         - name: condition
           # ClinicalTrials.gov query.cond search (Essie syntax)
           default: lung cancer
+        - name: search
+          # ClinicalTrials.gov query.term free-text search (Essie syntax). Blank: condition only.
+          # Set condition blank to search by this alone; with both, studies must match both.
+          default: ""
         - name: max_studies
           # Blank lands every match. A capped run never starts incremental pulls.
           default: ""
@@ -37,6 +41,15 @@ resources:
             - task_key: run_pipeline
           notebook_task:
             notebook_path: ../src/02_tag_pii.py
+        - task_key: tag_pii_bronze_silver
+          depends_on:
+            - task_key: run_pipeline
+          notebook_task:
+            notebook_path: ../src/02_tag_pii.py
+            # pii_* rather than catalog/schema, which job parameters would override.
+            base_parameters:
+              pii_catalog: ${var.bronze_silver_catalog}
+              pii_schema: ${resources.schemas.clinical_trials_bronze_silver.name}
         - task_key: sync_vector_index
           depends_on:
             - task_key: tag_pii

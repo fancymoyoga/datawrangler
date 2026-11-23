@@ -6,7 +6,7 @@ compute cannot reach the API. Stdlib only.
 
     python scripts/fetch_and_upload.py --profile monicaenders \
         --landing-path /Volumes/workspace/dev_monica_enders_clinical_trials/landing/studies \
-        --condition "lung cancer" [--max-studies 100] [--updated-since 2026-10-01]
+        --condition "lung cancer" [--search "immunotherapy"] [--max-studies 100] [--updated-since 2026-10-01]
 
 Without --max-studies it lands every match. It doesn't record runs in ingest_runs, so pass
 --updated-since yourself for an incremental pull.
@@ -42,7 +42,9 @@ def upload(local_dir, landing_path, profile):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--condition", default="lung cancer", help="condition to search (query.cond)")
+    parser.add_argument("--condition", default="lung cancer",
+                        help="condition to search (query.cond); pass \"\" to search by --search only")
+    parser.add_argument("--search", help="free-text search string (query.term, Essie syntax)")
     parser.add_argument("--max-studies", type=int, help="cap on studies landed (default: every match)")
     parser.add_argument("--updated-since", type=datetime.date.fromisoformat,
                         help="only studies whose last update was posted on or after this YYYY-MM-DD date")
@@ -60,7 +62,8 @@ def main():
 
     out_dir = args.out_dir or tempfile.mkdtemp(prefix="ctgov_landing_")
     try:
-        result, unreachable = fetch_search(args.condition, out_dir, args.max_studies, args.updated_since)
+        result, unreachable = fetch_search(args.condition, out_dir, args.max_studies, args.updated_since,
+                                           search=args.search)
         if unreachable:
             print(f"ERROR: API unreachable from this machine too: {unreachable}", file=sys.stderr)
         if result["written"] and not args.no_upload:

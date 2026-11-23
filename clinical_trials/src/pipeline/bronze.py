@@ -3,10 +3,12 @@ from pyspark import pipelines as dp
 import transforms
 
 LANDING_PATH = spark.conf.get("landing_path")
+# Bronze and silver publish to their own catalog.schema; gold stays in the pipeline default.
+BRONZE_SILVER = spark.conf.get("bronze_silver_schema")
 
 
 @dp.table(
-    name="bronze_studies_raw",
+    name=f"{BRONZE_SILVER}.bronze_studies_raw",
     comment="Landed ClinicalTrials.gov envelopes, one row per file, unparsed",
     table_properties={"delta.enableChangeDataFeed": "true"},
 )

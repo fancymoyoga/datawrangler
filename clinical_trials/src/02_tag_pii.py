@@ -2,7 +2,8 @@
 # MAGIC %md
 # MAGIC # Tag PII with Unity Catalog column tags
 # MAGIC
-# MAGIC Scans every table in the schema and sets column tags `pii` (`true` / `quasi` / `embedded`),
+# MAGIC Scans every table in one schema (`pii_catalog`.`pii_schema` if set, else `catalog`.`schema`;
+# MAGIC the job runs it for the gold schema and for the bronze/silver schema) and sets column tags `pii` (`true` / `quasi` / `embedded`),
 # MAGIC `pii_type` and `pii_detection`, plus a table tag `contains_pii`. Every decision is appended
 # MAGIC to `pii_tag_audit`.
 # MAGIC
@@ -11,7 +12,7 @@
 # MAGIC 2. regex over up to 1000 sampled values (emails, phone numbers; date-shaped values excluded)
 # MAGIC 3. optional `ai_classify` over up to 20 short distinct values
 # MAGIC
-# MAGIC The run fails if a direct identifier is found in `gold_study_documents` by passes 1 or 2;
+# MAGIC The run fails if a direct identifier is found in any `gold_*` table by passes 1 or 2;
 # MAGIC `ai_classify`-only hits there only warn.
 
 # COMMAND ----------
@@ -26,14 +27,16 @@ from pipeline.transforms import EMAIL_PATTERN, PHONE_PATTERN
 
 dbutils.widgets.text("catalog", "workspace")
 dbutils.widgets.text("schema", "clinical_trials")
+dbutils.widgets.text("pii_catalog", "")
+dbutils.widgets.text("pii_schema", "")
 dbutils.widgets.dropdown("use_ai_pii_check", "true", ["true", "false"])
 
-CATALOG = dbutils.widgets.get("catalog")
-SCHEMA = dbutils.widgets.get("schema")
+CATALOG = dbutils.widgets.get("pii_catalog").strip() or dbutils.widgets.get("catalog")
+SCHEMA = dbutils.widgets.get("pii_schema").strip() or dbutils.widgets.get("schema")
 USE_AI = dbutils.widgets.get("use_ai_pii_check") == "true"
 
 AUDIT_TABLE = "pii_tag_audit"
-GOLD_TABLES = {"gold_study_documents", "gold_study_documents_vs_source"}
+GOLD_PREFIX = "gold_"  # every gold_* table must be free of direct identifiers
 DIRECT_IDENTIFIERS = {"email", "phone", "person_name", "raw_json"}
 SAMPLE_ROWS = 1000
 AI_SAMPLE_VALUES = 20
@@ -294,7 +297,7 @@ print(f"audit: {len(audit)} rows appended to {CATALOG}.{SCHEMA}.{AUDIT_TABLE} (r
 
 # COMMAND ----------
 
-gold = {f"{t}.{col}": d for (t, col), d in decisions.items() if t in GOLD_TABLES}
+gold = {f"{t}.{col}": d for (t, col), d in decisions.items() if t.startswith(GOLD_PREFIX)}
 gold_direct = {col: d for col, d in gold.items()
                if d["detection"] in ("name_rule", "regex") and d["pii_type"] in DIRECT_IDENTIFIERS}
 for col, d in gold.items():

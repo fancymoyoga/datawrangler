@@ -372,7 +372,8 @@ Note: as written, the `/studies` `fields` pattern doesn't group its alternation:
 Ingest clinical trial records from the ClinicalTrials.gov v2 API into a medallion lakehouse on
 Databricks. The gold table feeds an AI model.
 
-- Source: `GET /studies?query.cond=<condition>` (default `lung cancer`), paged, capped at
+- Source: `GET /studies?query.cond=<condition>&query.term=<search>` (condition default
+  `lung cancer`, search default blank; at least one required), paged, capped at
   `max_studies` per run (default 100)
 - Layers: bronze (raw) → silver (validated, deduplicated, PII-tagged) → gold (PII-free, AI-ready)
 
@@ -381,7 +382,10 @@ Databricks. The gold table feeds an AI model.
 - **Databricks Free Edition**: serverless compute only. Never add cluster configs
   (`new_cluster`, `job_clusters`, `clusters`, instance pools, `node_type_id`).
   Pipelines use `serverless: true`; job tasks use serverless environments.
-- **Catalog**: `workspace`.
+- **Catalogs**: `workspace` (`var.catalog`) holds the landing volume, `ingest_runs`, gold, the
+  vector index and the agent. Bronze, silver and the gold `gold_cll_wm_*` tables publish to `clinicaltrials` (`var.bronze_silver_catalog`),
+  schema `${resources.schemas.clinical_trials_bronze_silver.name}`, via fully qualified dataset names
+  built from the pipeline setting `bronze_silver_schema`.
 - **Packaging**: everything is a Databricks Asset Bundle (`databricks.yml` + `resources/`).
   The `dev` target uses `mode: development`. `databricks.yml` must keep
   `include: resources/*.yml`: without it a deploy deletes every resource defined there.
@@ -399,9 +403,10 @@ Databricks. The gold table feeds an AI model.
 ## As built
 
 - **Landing** (`src/ctgov_client.py`, run by `src/01_ingest_api.py`): searches `/studies` with
-  `query.cond`, `fields=protocolSection|hasResults`, `sort=@relevance`, `pageSize=1000`, follows
+  `query.cond` (job param `condition`) and/or `query.term` (job param `search`), `fields=protocolSection|hasResults|resultsSection.outcomeMeasuresModule`, `sort=@relevance`,
+  `pageSize=500` (with results a 1,000-study page reaches ~20 MB, near the 16 MB variant limit), follows
   `nextPageToken` with the first page's parameters unchanged, and checks `/version` each run.
-  Each page lands as one envelope (about 12 MB for 1,000 studies) at
+  Each page lands as one envelope (about 10 MB for 500 studies) at
   `<volume>/studies/search/{yyyyMMddTHHmmssZ}_{ingest_id[:8]}_page{nnnn}.json`:
   `source_url, http_status, ingested_at, ingest_id, query, page, payload`, where `payload` is the
   page (`studies`, `nextPageToken`, `totalCount`). A failed page is landed with its error body and
@@ -409,8 +414,8 @@ Databricks. The gold table feeds an AI model.
   Loader never sees partial files. Retries 429/5xx with backoff; if the API is unreachable,
   `scripts/fetch_and_upload.py` does the same search locally and uploads with `databricks fs cp`.
   Older single-study envelopes (`{NCT_ID}/...json`, with `requested_nct_id`) still parse.
-- **Incremental pulls**: `01_ingest_api.py` records every run in `ingest_runs` (`complete` = the
-  search reached its last page with no error or cap). With `incremental=true`, a condition that has
+- **Incremental pulls**: `01_ingest_api.py` records every run in `ingest_runs` (keyed on `condition` + `search_term`; `complete` = the
+  search reached its last page with no error or cap). With `incremental=true`, a condition + search pair that has
   a complete run is searched with `filter.advanced=AREA[LastUpdatePostDate]RANGE[<that run's UTC
   date - 1 day>,MAX]`; the day of overlap covers US-dated updates posted after the run. Blank
   `max_studies` lands every match; a capped run is never complete. `incremental=false` re-fetches all.
@@ -420,15 +425,40 @@ Databricks. The gold table feeds an AI model.
   `expect_all`), `silver_studies_quarantine` (same parse, `failed_rules` array),
   `silver_studies` (Auto CDC SCD Type 1 streaming table from validated, keyed on `nct_id`,
   sequenced by `struct(last_update_posted_date, ingested_at)`; keeps `payload` for the child
-  tables), `silver_study_contacts` (PII), `silver_study_locations`. Rules live in
+  tables), `silver_study_contacts` (PII), `silver_study_locations`,
+  `silver_study_eligibility_criteria` (one row per inclusion/exclusion criterion split out of the
+  eligibility markdown; text with no section headers is `unspecified`), `silver_study_outcomes`
+  (one row per primary/secondary/other planned outcome measure), `silver_study_conditions` (one row
+  per condition per study, case-insensitive repeats dropped), `silver_study_outcome_results` (posted
+  results: one row per study × outcome measure × arm/group × class × category, with `value`,
+  `value_numeric`, spread/CI limits and the arm's denominator). Studies landed before results were
+  added to `fields` have none until re-fetched with `incremental=false`. Rules live in
   `src/pipeline/transforms.py`; NULL rule results count as failures.
   Known gap: the `known_overall_status` rule hard-codes the status list instead of loading
   `/studies/enums` (development rule 9).
-- **PII tagging** (`src/02_tag_pii.py`): UC column tags `pii` / `pii_type` / `pii_detection`,
+- **PII tagging** (`src/02_tag_pii.py`, run once per schema: tasks `tag_pii` for gold and
+  `tag_pii_bronze_silver`, which passes `pii_catalog`/`pii_schema`): UC column tags `pii` / `pii_type` / `pii_detection`,
   table tag `contains_pii`, audit in `pii_tag_audit`. Removes tags a run no longer confirms and
   skips pipeline-internal `__materialization_*` tables. Fails the run on direct identifiers in gold.
 - **Gold** `gold_study_documents`: allow-listed columns only; free text and `document_text`
   scrubbed of emails/phones; rows under 200 chars dropped; CDF on.
+- **Gold CLL / WM cohort** (in the `clinicaltrials` catalog): `gold_cll_wm_studies` (gold_study_documents rows whose conditions,
+  keywords or titles match `COHORT_TERMS` in transforms.py, plus `disease_groups`, `matched_terms`,
+  `matched_on`), and its child tables `gold_cll_wm_conditions`, `gold_cll_wm_eligibility_criteria`,
+  `gold_cll_wm_outcomes`, `gold_cll_wm_outcome_results` (posted results per arm plus
+  `arm_drug_classes` from the arm's title/description) (free text scrubbed). SLL and Richter count as CLL, LPL as WM; a bare "WM"
+  only counts in conditions/keywords. The PII gate in 02_tag_pii.py covers every `gold_*` table.
+- **CLL trial completion model** (`src/06_train_cll_trial_model.py`, job `cll_trial_model_job`, run
+  after `clinical_trials_job`): the pipeline MV `gold_cll_trial_features` (`trial_features` in
+  transforms.py) has design-time features of the CLL studies (phase, design, sponsor, `DRUG_CLASSES`
+  flags, criteria counts) and `ended_early` (1 = terminated/withdrawn, 0 = completed, NULL otherwise).
+  Enrollment, results, dates after start and site lists are left out because they leak the outcome.
+  Training uses only trials started by `max_train_start_year` (default 2019) and drops `start_year`:
+  of later trials, mostly early stops have finished, so recency would read as risk.
+  The notebook picks logistic regression or gradient boosting by 5-fold CV AUC, registers
+  `clinicaltrials.<schema>.cll_trial_completion_model` (alias `champion`), and overwrites
+  `gold_cll_trial_risk_scores` (ongoing trials) and `gold_cll_drug_class_summary`. It models trial
+  operations, not patient outcomes or treatment efficacy.
 - **Vector Search** (`src/03_vector_index.py`): Free Edition can't index materialized views, so gold
   is merged into the Delta table `gold_study_documents_vs_source`, and the Delta Sync index
   `gold_study_documents_index` (endpoint `clinical-trials-vs`, `databricks-gte-large-en`) syncs from it.
@@ -443,15 +473,17 @@ Databricks. The gold table feeds an AI model.
 clinical_trials/
 ├── databricks.yml                     # bundle, variables, sync excludes, dev target
 ├── resources/
-│   ├── clinical_trials.schema.yml     # schema clinical_trials
+│   ├── clinical_trials.schema.yml     # schema clinical_trials (workspace: gold)
+│   ├── clinical_trials_bronze_silver.schema.yml  # schema clinical_trials (clinicaltrials: bronze, silver)
 │   ├── landing.volume.yml             # managed volume landing
 │   ├── clinical_trials.pipeline.yml   # SDP pipeline (serverless, triggered)
 │   ├── clinical_trials.job.yml        # ingest → pipeline → tag PII → sync vector index
 │   ├── clinical_trials_agent.job.yml  # log, register and test the agent
+│   ├── cll_trial_model.job.yml        # train the CLL trial completion model
 │   └── study_contacts.job.yml         # FHIR loader (load_study_contacts.py)
 ├── src/
 │   ├── ctgov_client.py                # stdlib search client + envelope writer (shared)
-│   ├── 01_ingest_api.py … 05_test_agent.py
+│   ├── 01_ingest_api.py … 06_train_cll_trial_model.py
 │   ├── agent/agent.py                 # ResponsesAgent
 │   └── pipeline/                      # bronze.py, silver.py, gold.py, transforms.py
 ├── scripts/fetch_and_upload.py        # local fallback if compute can't reach the API
@@ -467,6 +499,7 @@ databricks bundle plan -t dev --profile monicaenders     # check for unexpected 
 databricks bundle deploy -t dev --profile monicaenders
 databricks bundle run clinical_trials_job -t dev --profile monicaenders
 databricks bundle run clinical_trials_agent_job -t dev --profile monicaenders
+databricks bundle run cll_trial_model_job -t dev --profile monicaenders
 
 # Local transform test: needs PySpark 4.0+, Java 17+, Python <= 3.13
 python tests/test_transforms.py

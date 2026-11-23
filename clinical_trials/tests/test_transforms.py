@@ -26,6 +26,11 @@ import transforms as t  # noqa: E402
 from ctgov_client import build_envelope, land_page, write_envelope  # noqa: E402
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+# Markdown as the API returns it: escaped ">", nested list items, numbered items, a wrapped line.
+RICH_CRITERIA = ("Inclusion Criteria:\n\n* Age \\>= 18 years\n* Measurable disease, defined as:\n\n"
+                 "  * at least one lesion\n  * per RECIST 1.1\n* ECOG 0-1\n\n"
+                 "**Exclusion Criteria:**\n\n1. Prior ibrutinib\n2. Active infection requiring\n"
+                 "   systemic therapy")
 
 
 def study(nct_id, title="Ibrutinib in Waldenstrom Macroglobulinemia", status="RECRUITING",
@@ -102,6 +107,19 @@ def study(nct_id, title="Ibrutinib in Waldenstrom Macroglobulinemia", status="RE
             },
         },
         "hasResults": True,
+        "resultsSection": {"outcomeMeasuresModule": {"outcomeMeasures": [
+            {"type": "PRIMARY", "title": "Overall Response Rate", "paramType": "NUMBER",
+             "dispersionType": "95% Confidence Interval", "unitOfMeasure": "percentage of participants",
+             "timeFrame": "Up to 2 years", "reportingStatus": "POSTED",
+             "groups": [{"id": "OG000", "title": "Ibrutinib + Ixazomib", "description": "Ibrutinib PO daily"},
+                        {"id": "OG001", "title": "Bendamustine + Rituximab"}],
+             "denoms": [{"units": "Participants", "counts": [{"groupId": "OG000", "value": "13"},
+                                                             {"groupId": "OG001", "value": "12"}]}],
+             "classes": [{"categories": [{"measurements": [
+                 {"groupId": "OG000", "value": "84.6", "lowerLimit": "54.6", "upperLimit": "98.1"},
+                 {"groupId": "OG001", "value": "NA", "comment": "Not estimable: call 555-123-4567"}]}]}]},
+            {"type": "SECONDARY", "title": "Progression-free survival", "reportingStatus": "NOT_POSTED"},
+        ]}},
     }
     for path, value in extra.items():
         node = s
@@ -150,7 +168,12 @@ def build_landing(root):
     at = T0 + timedelta(minutes=30)
     url = "https://clinicaltrials.gov/api/v2/studies?query.cond=test"
     query = {"query.cond": "test"}
-    land_page(root, url, 200, {"studies": [study("NCT00000009"), copy.deepcopy(v2)],
+    land_page(root, url, 200, {"studies": [study("NCT00000009", **{
+        "protocolSection.eligibilityModule.eligibilityCriteria": RICH_CRITERIA,
+        # a case-insensitive repeat and a blank are dropped
+        "protocolSection.conditionsModule.conditions": [
+            "Waldenstrom Macroglobulinemia", " ", "Lymphoma", "waldenstrom  macroglobulinemia"]}),
+        copy.deepcopy(v2)],
                                "nextPageToken": "abc"}, at, "run-30-search", query, 1)
     land_page(root, url, 200, {"studies": [], "nextPageToken": "def"}, at, "run-30-search", query, 2)
     land_page(root, url, 400, b"pageToken is invalid", at, "run-30-search", query, 3)
@@ -204,6 +227,9 @@ def main():
     studies = t.apply_scd1(validated).cache()
     contacts = t.contacts(studies)
     locations = t.locations(studies)
+    criteria = t.eligibility_criteria(studies).cache()
+    outcomes = t.outcomes(studies).cache()
+    conditions = t.conditions(studies).cache()
     gold_all = t.documents(studies).cache()
     gold = gold_all.where(" AND ".join(t.GOLD_RULES.values()))
 
@@ -223,6 +249,10 @@ def main():
          "nct_id", "name", "email", "phone", "phone_ext", "sources", truncate=False)
     show("silver_study_locations", locations, "nct_id", "facility", "city", "zip", "country", "lat", "lon",
          F.expr(t.LOCATION_RULES["valid_coordinates"]).alias("valid_coordinates"), truncate=False)
+    show("silver_study_eligibility_criteria", criteria, "nct_id", "criterion_type", "criterion_number",
+         "criterion_text", truncate=False)
+    show("silver_study_outcomes", outcomes, "nct_id", "outcome_type", "outcome_number", "measure",
+         "time_frame", truncate=False)
     show("gold_study_documents (before min-length rule)", gold_all, "nct_id", "document_chars")
     show("gold_study_documents", gold, "nct_id", "document_chars")
     doc = gold.where("nct_id = 'NCT00000001'").first()["document_text"]
@@ -259,6 +289,83 @@ def main():
     assert jane[0]["sources"] == ["central_contact", "location_contact"]
     assert len(c) == 3, c  # Jane Doe, Dr. John Smith, John Smith (responsible party)
     assert locations.where("nct_id = 'NCT00000001'").count() == 2  # duplicate site removed
+
+    def criteria_of(nct_id, kind):
+        rows = criteria.where(f"nct_id = '{nct_id}' AND criterion_type = '{kind}'").orderBy("criterion_number")
+        return [r["criterion_text"] for r in rows.collect()]
+
+    assert criteria_of("NCT00000009", "inclusion") == [
+        "Age >= 18 years", "Measurable disease, defined as: at least one lesion per RECIST 1.1", "ECOG 0-1"]
+    assert criteria_of("NCT00000009", "exclusion") == [
+        "Prior ibrutinib", "Active infection requiring systemic therapy"]
+    assert criteria_of("NCT00000001", "inclusion") == [
+        "Age >= 18 years", "Questions: call 555-123-4567 or email trials@example.org"]
+    assert criteria.where("nct_id = 'NCT00000007'").count() == 0  # no eligibility text
+
+    o = {(r["outcome_type"], r["outcome_number"]): r for r in outcomes.where("nct_id = 'NCT00000001'").collect()}
+    assert set(o) == {("primary", 1), ("secondary", 1)}, o
+    assert o[("primary", 1)]["measure"] == "Overall response rate"
+    assert o[("primary", 1)]["time_frame"] == "Up to 2 years" and o[("secondary", 1)]["time_frame"] is None
+    assert outcomes.select("outcome_id").distinct().count() == outcomes.count()
+
+    cond = {r["nct_id"]: [] for r in studies.collect()}
+    for r in conditions.orderBy("nct_id", "condition_number").collect():
+        cond[r["nct_id"]].append(r["condition"])
+    assert cond["NCT00000001"] == ["Waldenstrom Macroglobulinemia"]
+    assert cond["NCT00000009"] == ["Waldenstrom Macroglobulinemia", "Lymphoma"], cond
+    assert cond["NCT00000007"] == []  # no conditions listed
+
+    cohort_cases = {
+        "Leukemia, Lymphocytic, Chronic, B-Cell": ["CLL"], "B-CLL": ["CLL"], "CLL/SLL": ["CLL", "SLL"],
+        "Chronic Lymphoid Leukaemia": ["CLL"], "Lymphoma, Small Lymphocytic": ["SLL"],
+        "Richter Syndrome": ["Richter transformation"], "Waldenström's Macroglobulinaemia (WM)": ["WM"],
+        "Lymphoplasmacytic Lymphoma": ["LPL"], "Other B-cell NHL Subtypes, Including WM": ["WM"],
+        "T-Cell Chronic Lymphocytic Leukemia": [], "Prolymphocytic Leukemia": [],
+        "Acute Lymphocytic Leukemia": [], "Waldenström; Hypergammaglobulinemia": [],
+    }
+    rows = literal_df(spark, [(k,) for k in cohort_cases], ["v"]).select(
+        "v", F.array_sort(F.array_distinct(F.transform(
+            t._cohort_hits(F.col("v"), F.lit("condition")), lambda h: h["term"]))).alias("terms")).collect()
+    for r in rows:
+        assert r["terms"] == cohort_cases[r["v"]], (r["v"], r["terms"])
+    # A bare "WM" in a title doesn't count.
+    assert literal_df(spark, [("WM lesions on MRI",)], ["v"]).select(
+        F.size(t._cohort_hits(F.col("v"), F.lit("title"))).alias("n")).first()["n"] == 0
+
+    cohort = t.cohort_studies(gold).cache()
+    c = {r["nct_id"]: r for r in cohort.collect()}
+    assert set(c) == {"NCT00000001", "NCT00000006", "NCT00000009"}, set(c)
+    assert c["NCT00000001"]["disease_groups"] == ["WM"] and c["NCT00000001"]["matched_on"] == ["condition", "title"]
+    cohort_conditions = t.cohort_conditions(conditions, cohort)
+    lymphoma = cohort_conditions.where("nct_id = 'NCT00000009' AND condition = 'Lymphoma'").first()
+    assert lymphoma["matched_terms"] == [] and cohort_conditions.where("nct_id = 'NCT00000007'").count() == 0
+    cohort_criteria = {r["criterion_text"] for r in t.cohort_eligibility_criteria(criteria, cohort)
+                       .where("nct_id = 'NCT00000001'").collect()}
+    assert "Questions: call [phone removed] or email [email removed]" in cohort_criteria, cohort_criteria
+    assert t.cohort_outcomes(outcomes, cohort).where("nct_id = 'NCT00000001'").count() == 2
+
+    results = t.outcome_results(studies).cache()
+    r1 = {r["group_id"]: r for r in results.where("nct_id = 'NCT00000001'").collect()}
+    assert set(r1) == {"OG000", "OG001"}  # the NOT_POSTED measure has no values
+    assert r1["OG000"]["value_numeric"] == 84.6 and r1["OG000"]["upper_limit"] == 98.1
+    assert r1["OG000"]["group_title"] == "Ibrutinib + Ixazomib" and r1["OG000"]["denom_count"] == 13
+    assert r1["OG001"]["value"] == "NA" and r1["OG001"]["value_numeric"] is None
+    assert r1["OG001"]["outcome_type"] == "primary" and r1["OG001"]["group_description"] is None
+    assert results.select("result_id").distinct().count() == results.count()
+    arms = {r["group_id"]: r for r in t.cohort_outcome_results(results, cohort)
+            .where("nct_id = 'NCT00000001'").collect()}
+    assert arms["OG000"]["arm_drug_classes"] == ["btk_inhibitor"]
+    assert arms["OG001"]["arm_drug_classes"] == ["anti_cd20", "chemotherapy"]
+    assert "[phone removed]" in arms["OG001"]["value_comment"]
+
+    feats = {r["nct_id"]: r for r in t.trial_features(cohort, studies, criteria).collect()}
+    assert set(feats) == set(c)
+    f1 = feats["NCT00000001"]  # ibrutinib + ixazomib, RECRUITING, phase 2, 2 inclusion criteria
+    assert f1["ended_early"] is None and f1["is_ongoing"] and f1["start_year"] == 2018
+    assert f1["btk_inhibitor"] and not f1["bcl2_inhibitor"] and f1["n_drug_classes"] == 1
+    assert f1["phase"] == "PHASE2" and f1["allocation"] == "UNKNOWN" and f1["has_drug_intervention"]
+    assert f1["n_inclusion_criteria"] == 2 and f1["n_exclusion_criteria"] == 0 and f1["n_interventions"] == 3
+    assert set(feats["NCT00000001"].asDict()).isdisjoint({"enrollment_count", "has_results", "completion_date"})
 
     assert {r["nct_id"] for r in gold.collect()} == {"NCT00000001", "NCT00000006", "NCT00000009"}
     assert set(gold.columns).isdisjoint({"responsible_party_investigator_name", "payload", "raw_json"})
